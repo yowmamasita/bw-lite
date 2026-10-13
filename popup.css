@@ -1,0 +1,32 @@
+:root { --bg: #000; --fg: #fff; --muted: #8c8c8c; --line: #333; --err: #ff6b6b; color-scheme: dark; }
+:root[data-theme="light"] { --bg: #fff; --fg: #000; --muted: #6b6b6b; --line: #d0d0d0; --err: #c40000; color-scheme: light; }
+* { box-sizing: border-box; border-radius: 0; }
+[hidden] { display: none !important; }
+body { margin: 0; width: 380px; max-height: 580px; background: var(--bg); color: var(--fg); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+main { padding: 12px; }
+h1 { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; margin: 0 0 12px; }
+form { display: grid; gap: 10px; }
+label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+input, textarea { width: 100%; padding: 7px 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; text-transform: none; letter-spacing: normal; appearance: none; }
+input:focus, textarea:focus { outline: none; border-color: var(--fg); }
+button:focus-visible { outline: 1px solid var(--fg); outline-offset: 1px; }
+button { padding: 5px 9px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; cursor: pointer; white-space: nowrap; }
+button:hover:not(:disabled), button.primary { background: var(--fg); border-color: var(--fg); color: var(--bg); }
+button.primary:hover:not(:disabled) { background: var(--bg); color: var(--fg); }
+button:disabled { opacity: .4; cursor: default; }
+button.link { border: 0; padding: 8px 0; background: none; color: var(--muted); text-decoration: underline; }
+button.link:hover { background: none; color: var(--fg); }
+header, .inline { display: flex; gap: 6px; align-items: center; }
+header { margin-bottom: 8px; align-items: stretch; }
+header input { flex: 1; }
+.row { display: flex; gap: 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
+.info { flex: 1; min-width: 0; cursor: pointer; }
+.info:hover b { text-decoration: underline; }
+.info b, .info small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.info b { font-weight: 600; }
+.info small, .muted { color: var(--muted); }
+.actions { display: flex; gap: 4px; }
+.actions button { padding: 3px 6px; font-size: 11px; }
+.totp { font-variant-numeric: tabular-nums; }
+.err { color: var(--err); margin: 4px 0 0; }
+.err:empty { display: none; }
