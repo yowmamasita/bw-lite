@@ -12,12 +12,13 @@ API; none of Bitwarden's client code is used.
 
 ## Install
 
-Download the latest `bw-lite-<version>.zip` from [Releases](https://github.com/yowmamasita/bw-lite/releases), unzip it,
-then in Chrome open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and pick the `bw-lite`
-folder.
+Download the latest `bw-lite-<version>.zip` from [Releases](https://github.com/yowmamasita/bw-lite/releases) and unzip
+it somewhere permanent (Chrome loads the extension from that folder on every start). Then open `chrome://extensions`,
+turn on **Developer mode**, click **Load unpacked** and pick the `bw-lite` folder. To update, replace the folder's
+contents and click the extension's reload button.
 
-A signed `.crx` is attached to each release too. Chrome on Windows and macOS refuses `.crx` files that don't come from
-the Chrome Web Store, so use the zip there; the `.crx` is for Chromium builds and enterprise policies that allow it.
+The extension ID is always `edggmjogcnhnppgfidekhhdjpdjcpdmk`. There is no `.crx`: Chrome refuses `.crx` files that
+don't come from the Chrome Web Store (`CRX_REQUIRED_PROOF_MISSING`).
 
 ## Use
 
@@ -70,7 +71,7 @@ public suffix list.
 docker run -d --name bwlite-vw -p 127.0.0.1:8099:80 -e I_REALLY_WANT_VOLATILE_STORAGE=true \
   -e LOGIN_RATELIMIT_MAX_BURST=100 -e LOGIN_RATELIMIT_SECONDS=1 vaultwarden/server
 node test.mjs   # login, sync, create, edit, org items, per-item keys, token refresh, Argon2id
-./pack.sh       # dist/bw-lite-<version>.zip; with BW_LITE_KEY and CHROME set, also the signed .crx
+./pack.sh       # dist/bw-lite-<version>.zip
 ```
 
 ## License
