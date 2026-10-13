@@ -31,12 +31,12 @@ const unlocked = () => accounts.filter((a) => keys[a.id]);
 const locked = () => accounts.filter((a) => !keys[a.id]);
 const rank = (id) => accounts.findIndex((a) => a.id === id);
 const strip = ({ raw, key, notes, ...listFields }) => listFields;
-const byName = (a, b) => collator.compare(a.name, b.name);
+const byName = (a, b) => collator.compare(a.name, b.name) || collator.compare(a.username, b.username);
 
 // Night (default) / day toggle; the choice is a per-browser convenience, so localStorage is enough.
 function themeButton() {
   const root = document.documentElement;
-  const label = () => (root.dataset.theme === 'light' ? 'Night' : 'Day');
+  const label = () => (root.dataset.theme === 'light' ? 'night' : 'day');
   const b = h('button', {
     type: 'button', className: 'link', title: 'Toggle day/night',
     onclick: () => {
@@ -332,7 +332,7 @@ async function fill(item) {
 }
 
 function totpButton(item) {
-  const b = h('button', { className: 'totp', title: 'Copy TOTP code', onclick: async () => copy(b, (await bw.totp(item.totp)).code) });
+  const b = h('button', { className: 'quiet totp', title: 'Copy TOTP code', onclick: async () => copy(b, (await bw.totp(item.totp)).code) });
   const tick = () => bw.totp(item.totp).then((t) => (b.textContent = `${t.code} · ${t.remaining}s`), () => (b.textContent = 'bad TOTP'));
   tick();
   b._tick = tick;
@@ -340,40 +340,54 @@ function totpButton(item) {
 }
 setInterval(() => document.querySelectorAll('.totp').forEach((b) => b.textContent !== 'Copied' && b._tick?.()), 1000);
 
+// Layout: top bar (brand + text actions), full-width search, a line saying what the list shows, then logins grouped
+// under their name with the username leading each row. Fill is the only boxed button; the autofill pick is solid.
 function vaultView() {
   const multi = accounts.length > 1;
   let top; // the login autofill uses: first match in vault order; Enter fills it
   const q = h('input', {
-    type: 'search', placeholder: 'Search vault', value: query,
+    type: 'search', placeholder: 'Search all logins', value: query,
     oninput: () => ((query = q.value), draw()),
     onkeydown: (e) => e.key === 'Enter' && top && fill(top),
   });
+  const context = h('p', { className: 'context' });
   const list = h('div', { className: 'list' });
-  const row = (i) => h('div', { className: 'row' },
-    h('div', { className: 'info', title: 'Edit', onclick: () => openEdit(i).catch((e) => status(e.message)) },
-      h('b', {}, i.name || '(no name)'),
-      h('small', {}, multi && h('span', { className: 'tag' }, acct(i.a)?.label), i.username)),
+  const quiet = (text, title, onclick) => h('button', { className: 'quiet', title, onclick }, text);
+  const row = (i, mixed) => h('div', { className: 'row' },
+    h('div', { className: 'info' },
+      h('b', { title: i.username }, i.username || '(no username)'),
+      (mixed || i.totp) && h('small', {}, mixed && h('span', { className: 'vault', title: 'Vault' }, acct(i.a)?.label), i.totp && totpButton(i))),
     h('div', { className: 'actions' },
       host && bw.matches(i, host) && h('button', { className: i === top ? 'primary' : '', title: i === top ? 'Fill (Enter)' : 'Fill', onclick: () => fill(i) }, 'Fill'),
-      i.username && h('button', { title: 'Copy username', onclick: (e) => copy(e.target, i.username) }, 'User'),
-      i.password && h('button', { title: 'Copy password', onclick: (e) => copy(e.target, i.password) }, 'Pass'),
-      i.totp && totpButton(i)));
+      i.username && quiet('user', 'Copy username', (e) => copy(e.target, i.username)),
+      i.password && quiet('pass', 'Copy password', (e) => copy(e.target, i.password)),
+      quiet('edit', 'Edit', () => openEdit(i).catch((e) => status(e.message)))));
   const draw = () => {
     const s = q.value.trim().toLowerCase();
     const items = s
       ? vault.filter((i) => `${i.name} ${i.username} ${i.uris.join(' ')}`.toLowerCase().includes(s))
       : host ? vault.filter((i) => bw.matches(i, host)).sort((x, y) => rank(x.a) - rank(y.a)) : vault;
     top = host && items[0] && bw.matches(items[0], host) ? items[0] : null;
-    list.replaceChildren(...(items.length
-      ? items.slice(0, 50).map(row)
-      : [h('p', { className: 'muted' }, s ? 'No matches' : 'No logins for this site. Type to search.')]));
+    const shown = items.slice(0, 50);
+    const n = `${items.length} login${items.length === 1 ? '' : 's'}`;
+    context.textContent = s ? `${items.length ? n : 'No logins'} matching “${q.value.trim()}”${items.length > 50 ? ', first 50 shown' : ''}`
+      : host ? (items.length ? `${n} for ${host}` : `No logins for ${host}. Type to search.`)
+      : `${n}${items.length > 50 ? ', first 50 shown' : ''}`;
+    const mixed = new Set(shown.map((i) => i.a)).size > 1; // vault names only when they tell rows apart
+    const out = [];
+    let group;
+    for (const i of shown) {
+      if (i.name !== group) out.push(h('div', { className: 'group' }, (group = i.name) || '(no name)'));
+      out.push(row(i, mixed));
+    }
+    list.replaceChildren(...out);
   };
   const last = Math.min(...unlocked().map((a) => a.lastSync || 0));
   const ago = last ? Math.round((Date.now() - last) / 60e3) : null;
   const syncBtn = h('button', {
-    id: 'sync', title: `Sync now (Ctrl+S)${ago == null ? '' : ` · last synced ${ago < 1 ? 'just now' : ago < 120 ? `${ago} min ago` : `${Math.round(ago / 60)} h ago`}`}`,
-    onclick: () => ((syncBtn.textContent = 'Syncing…'), run(syncBtn, document.getElementById('status'), syncAll).finally(() => (syncBtn.textContent = 'Sync'))),
-  }, 'Sync');
+    id: 'sync', className: 'quiet', title: `Sync now (Ctrl+S)${ago == null ? '' : ` · last synced ${ago < 1 ? 'just now' : ago < 120 ? `${ago} min ago` : `${Math.round(ago / 60)} h ago`}`}`,
+    onclick: () => ((syncBtn.textContent = 'syncing…'), run(syncBtn, document.getElementById('status'), syncAll).finally(() => (syncBtn.textContent = 'sync'))),
+  }, 'sync');
   const neverLock = h('input', {
     type: 'checkbox', checked: !!st.neverLock,
     onchange: async () => {
@@ -386,9 +400,12 @@ function vaultView() {
     },
   });
   const stillLocked = locked().length;
+  const theme = themeButton();
+  theme.className = 'quiet';
   app.replaceChildren(
-    h('header', {}, q, h('button', { title: 'Add login', onclick: () => editView(null) }, '+'), syncBtn, h('button', { onclick: lockAll }, 'Lock'), themeButton()),
-    list, h('p', { id: 'status', className: 'err' }),
+    h('div', { className: 'bar' }, h('span', { className: 'brand' }, 'BW Lite'),
+      h('nav', {}, quiet('new', 'Add login', () => editView(null)), syncBtn, quiet('lock', 'Lock all vaults', lockAll), theme)),
+    h('header', {}, q), context, list, h('p', { id: 'status', className: 'err' }),
     h('footer', {},
       h('label', { className: 'check', title: 'Keeps the vault keys on this computer so the vaults stay open after a browser restart. Anyone with access to this browser profile can then open them.' }, neverLock, 'Never lock'),
       h('span', {},

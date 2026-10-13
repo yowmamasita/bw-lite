@@ -19,14 +19,13 @@ button.link:hover { background: none; color: var(--fg); }
 header, .inline { display: flex; gap: 6px; align-items: center; }
 header { margin-bottom: 8px; align-items: stretch; }
 header input { flex: 1; }
-.row { display: flex; gap: 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
-.info { flex: 1; min-width: 0; cursor: pointer; }
-.info:hover b { text-decoration: underline; }
+.row { display: flex; gap: 8px; align-items: center; padding: 5px 0; }
+.info { flex: 1; min-width: 0; }
 .info b, .info small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .info b { font-weight: 600; }
 .info small, .muted { color: var(--muted); }
-.actions { display: flex; gap: 4px; }
-.actions button { padding: 3px 6px; font-size: 11px; }
+.actions { display: flex; gap: 2px; align-items: center; }
+.actions button:not(.quiet) { padding: 2px 8px; margin-right: 4px; font-size: 11px; }
 .totp { font-variant-numeric: tabular-nums; }
 .err { color: var(--err); margin: 4px 0 0; }
 .err:empty { display: none; }
@@ -35,7 +34,17 @@ footer .link { padding: 0; margin-left: 12px; }
 label.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 input[type="checkbox"] { width: 12px; height: 12px; padding: 0; margin: 0; border: 1px solid var(--muted); cursor: pointer; }
 input[type="checkbox"]:checked { background: var(--fg); border-color: var(--fg); box-shadow: inset 0 0 0 2px var(--bg); }
-.tag { display: inline-block; margin-right: 6px; padding: 0 4px; border: 1px solid var(--muted); font-size: 10px; line-height: 1.5; text-transform: uppercase; letter-spacing: .04em; }
 .info input { padding: 3px 6px; font-weight: 600; }
 .muted { margin: 0 0 10px; }
 .list + .inline { margin-top: 10px; }
+.bar { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.brand { font-weight: 700; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+.bar nav { display: flex; gap: 2px; }
+button.quiet { border: 0; padding: 2px 5px; background: none; color: var(--muted); font-size: 11px; }
+button.quiet:hover:not(:disabled) { background: none; color: var(--fg); text-decoration: underline; }
+.context { color: var(--muted); font-size: 11px; margin: 0 0 4px; }
+.group { margin-top: 10px; padding-bottom: 3px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group:first-child { margin-top: 4px; }
+.info small { display: flex; gap: 8px; align-items: center; }
+.vault { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.info .totp { padding: 0; }

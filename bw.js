@@ -183,7 +183,7 @@ export async function decryptVault(sync, userKey, prev) {
       console.warn('Skipping undecryptable item', c.id, e);
     }
   }));
-  return out.filter(Boolean).sort((a, b) => collator.compare(a.name, b.name));
+  return out.filter(Boolean).sort((a, b) => collator.compare(a.name, b.name) || collator.compare(a.username, b.username));
 }
 
 // item: a decryptVault() entry to edit, or null to create. Starts from the synced (still encrypted) cipher so
