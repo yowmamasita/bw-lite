@@ -2,7 +2,14 @@ import * as bw from './bw.js';
 
 const app = document.getElementById('app');
 const local = chrome.storage.local, session = chrome.storage.session; // session = memory only, gone when the browser quits
-let st, userKey, vault = [], tab, host, query = '';
+const td = new TextDecoder();
+const collator = new Intl.Collator();
+
+// accounts: ordered list (the order is the autofill priority) of
+//   { id, server, email, label, kdf, protectedKey, tokens, lastSync, persistKey? }
+// Per account in local storage: `${id}:index` (encrypted list), `${id}:ids`, `${id}:profile`, `${id}:c:${cipherId}` (raw).
+// Per account in session storage: `${id}:key` and `${id}:list` (decrypted list, so an open is a read + JSON.parse).
+let st, accounts = [], keys = {}, lists = {}, vault = [], tab, host, query = '';
 
 function h(tag, props = {}, ...kids) {
   const el = document.createElement(tag);
@@ -13,10 +20,18 @@ function h(tag, props = {}, ...kids) {
   el.append(...kids.flat().filter((k) => k != null && k !== false && k !== ''));
   return el;
 }
-const save = (obj) => (Object.assign(st, obj), local.set(obj));
-const sess = () => ({ server: st.server, tokens: st.tokens, onTokens: (tokens) => save({ tokens }) });
 const field = (label, el) => h('label', {}, label, el);
 const title = (text) => h('h1', {}, text, themeButton());
+const newId = () => crypto.randomUUID().slice(0, 8);
+const saveAccounts = () => local.set({ accounts });
+const update = (a, patch) => (Object.assign(a, patch), saveAccounts());
+const sess = (a) => ({ server: a.server, tokens: a.tokens, onTokens: (tokens) => update(a, { tokens }) });
+const acct = (id) => accounts.find((a) => a.id === id);
+const unlocked = () => accounts.filter((a) => keys[a.id]);
+const locked = () => accounts.filter((a) => !keys[a.id]);
+const rank = (id) => accounts.findIndex((a) => a.id === id);
+const strip = ({ raw, key, notes, ...listFields }) => listFields;
+const byName = (a, b) => collator.compare(a.name, b.name);
 
 // Night (default) / day toggle; the choice is a per-browser convenience, so localStorage is enough.
 function themeButton() {
@@ -48,31 +63,101 @@ async function run(btn, err, fn) {
 }
 
 async function start() {
-  // small settings only; the encrypted index and raw ciphers are read when needed
-  const keys = ['server', 'email', 'kdf', 'protectedKey', 'tokens', 'deviceId', 'lastSync', 'neverLock', 'persistKey'];
-  let k, list;
-  [st, { userKey: k, list }, [tab]] = await Promise.all([
-    local.get(keys), session.get(['userKey', 'list']), chrome.tabs.query({ active: true, currentWindow: true })]);
+  let s;
+  [st, s, [tab]] = await Promise.all([
+    local.get(['accounts', 'deviceId', 'neverLock', 'server', 'email', 'kdf', 'protectedKey', 'tokens', 'persistKey']),
+    session.get(null), chrome.tabs.query({ active: true, currentWindow: true })]);
   host = /^https?:/.test(tab?.url) ? new URL(tab.url).hostname : null;
-  if (!st.protectedKey) return loginView();
-  if (!k && !st.persistKey) return unlockView();
-  userKey = bw.unb64(k || st.persistKey);
-  if (!list) return loadVault();
-  vault = JSON.parse(list);
+  if (!st.accounts && st.protectedKey) s = await migrate();
+  accounts = st.accounts || [];
+  for (const a of accounts) {
+    const k = s[`${a.id}:key`] || a.persistKey;
+    if (k) keys[a.id] = bw.unb64(k);
+  }
+  if (!accounts.length) return loginView();
+  if (!unlocked().length) return unlockView();
+  const problems = await loadVaults(s);
   vaultView();
+  if (problems) status(problems);
+}
+
+// 0.1/0.2 stored one account in flat keys. Move it into the accounts list; its cached vault is re-synced.
+async function migrate() {
+  const a = { id: newId(), server: st.server, email: st.email, label: st.email, kdf: st.kdf, protectedKey: st.protectedKey, tokens: st.tokens };
+  if (st.neverLock && st.persistKey) a.persistKey = st.persistKey;
+  st = { deviceId: st.deviceId, neverLock: st.neverLock, accounts: [a] };
+  await local.clear();
+  await local.set(st);
+  await session.clear();
+  return {};
 }
 
 // "Never lock" (like Bitwarden's Never timeout) also keeps the key in local storage so it survives a browser restart.
-async function setKey(key) {
-  userKey = key;
+async function setKey(a, key) {
+  keys[a.id] = key;
   const k = bw.b64(key);
-  await Promise.all([session.set({ userKey: k }), st.neverLock && local.set({ persistKey: k })]);
+  await Promise.all([session.set({ [`${a.id}:key`]: k }), st.neverLock && update(a, { persistKey: k })]);
+}
+
+async function setList(a, items, persist = true) {
+  lists[a.id] = items;
+  const list = JSON.stringify(items);
+  await Promise.all([
+    session.set({ [`${a.id}:list`]: list }),
+    persist && local.set({ [`${a.id}:index`]: await bw.encrypt(list, keys[a.id]) }),
+  ]);
+}
+
+function merge() {
+  const parts = unlocked().map((a) => lists[a.id] || []);
+  vault = parts.length === 1 ? parts[0] : parts.flat().sort(byName);
+}
+
+// Loads every unlocked account that isn't loaded yet; one failing account doesn't block the others.
+async function loadVaults(s = {}) {
+  const todo = unlocked().filter((a) => !lists[a.id]);
+  const res = await Promise.allSettled(todo.map(async (a) => {
+    if (s[`${a.id}:list`]) return (lists[a.id] = JSON.parse(s[`${a.id}:list`]));
+    const { [`${a.id}:index`]: index } = await local.get(`${a.id}:index`);
+    if (!index) return syncAccount(a);
+    await setList(a, JSON.parse(td.decode(await bw.decrypt(index, keys[a.id]))), false);
+  }));
+  merge();
+  return failures(todo, res);
+}
+
+const failures = (todo, res) =>
+  res.map((r, i) => r.status === 'rejected' && `${todo[i].label}: ${r.reason.message}`).filter(Boolean).join('\n');
+
+// Manual (Sync button / Ctrl+S), except for an account with no local data yet. Unchanged items aren't decrypted again.
+async function syncAccount(a) {
+  const p = `${a.id}:`;
+  const sync = await bw.api(sess(a), '/sync?excludeDomains=true');
+  const prev = new Map((lists[a.id] || []).map((i) => [i.id, i]));
+  const items = (await bw.decryptVault(sync, keys[a.id], prev)).map((i) => ({ ...strip(i), a: a.id }));
+  const ids = sync.ciphers.map((c) => c.id), keep = new Set(ids);
+  const { [`${p}ids`]: old = [] } = await local.get(`${p}ids`);
+  // raw ciphers stored one key per item so editing reads just the one it needs
+  await local.remove(old.filter((id) => !keep.has(id)).map((id) => `${p}c:${id}`));
+  await local.set({ [`${p}profile`]: sync.profile, [`${p}ids`]: ids, ...Object.fromEntries(sync.ciphers.map((c) => [`${p}c:${c.id}`, c])) });
+  await setList(a, items);
+  await update(a, { lastSync: Date.now() });
+}
+
+async function syncAll() {
+  const todo = unlocked();
+  const res = await Promise.allSettled(todo.map(syncAccount));
+  merge();
+  vaultView();
+  const problems = failures(todo, res);
+  if (problems) throw new Error(problems);
 }
 
 function loginView() {
-  const server = h('input', { value: st.server || 'https://vault.bitwarden.com', required: true });
-  const email = h('input', { type: 'email', value: st.email || '', required: true });
+  const server = h('input', { value: accounts.at(-1)?.server || 'https://vault.bitwarden.com', required: true });
+  const email = h('input', { type: 'email', required: true });
   const pw = h('input', { type: 'password', required: true });
+  const label = h('input', { placeholder: 'Defaults to the email' });
   const code = h('input', { autocomplete: 'one-time-code' });
   const codeField = h('label', { hidden: true }, h('span'), code);
   const btn = h('button', { className: 'primary' }, 'Log in');
@@ -82,13 +167,18 @@ function loginView() {
     onsubmit: (e) => {
       e.preventDefault();
       run(btn, err, async () => {
-        const srv = server.value.trim().replace(/\/+$/, '');
-        if (!st.deviceId) await save({ deviceId: crypto.randomUUID() });
+        const srv = server.value.trim().replace(/\/+$/, ''), mail = email.value.trim();
+        if (accounts.some((a) => a.server === srv && a.email.toLowerCase() === mail.toLowerCase())) throw new Error('This vault is already added');
+        if (!st.deviceId) await local.set({ deviceId: (st.deviceId = crypto.randomUUID()) }); // one id per install avoids new-device emails
         try {
-          const r = await bw.login(srv, email.value.trim(), pw.value, st.deviceId, need && { kind: need, value: code.value.trim() });
-          await save({ server: srv, email: email.value.trim(), kdf: r.kdf, protectedKey: r.protectedKey, tokens: r.tokens });
-          await setKey(r.userKey);
-          await syncVault();
+          const r = await bw.login(srv, mail, pw.value, st.deviceId, need && { kind: need, value: code.value.trim() });
+          const a = { id: newId(), server: srv, email: mail, label: label.value.trim() || mail, kdf: r.kdf, protectedKey: r.protectedKey, tokens: r.tokens };
+          accounts.push(a);
+          await saveAccounts();
+          await setKey(a, r.userKey);
+          await syncAccount(a);
+          merge();
+          vaultView();
         } catch (e) {
           if (!e.need) throw e;
           need = e.need;
@@ -98,12 +188,16 @@ function loginView() {
         }
       });
     },
-  }, field('Server', server), field('Email', email), field('Master password', pw), codeField, btn, err);
-  app.replaceChildren(title('BW Lite'), form);
-  (st.email ? pw : email).focus();
+  },
+    field('Server', server), field('Email', email), field('Master password', pw), field('Label', label), codeField,
+    h('div', { className: 'inline' }, btn, accounts.length && h('button', { type: 'button', onclick: accountsView }, 'Cancel')), err);
+  app.replaceChildren(title(accounts.length ? 'Add vault' : 'BW Lite'), form);
+  email.focus();
 }
 
+// One password box for every locked vault: each vault it opens unlocks, the rest stay locked.
 function unlockView() {
+  const todo = locked();
   const pw = h('input', { type: 'password', required: true });
   const btn = h('button', { className: 'primary' }, 'Unlock');
   const err = h('p', { className: 'err' });
@@ -111,73 +205,91 @@ function unlockView() {
     onsubmit: (e) => {
       e.preventDefault();
       run(btn, err, async () => {
-        await setKey(await bw.unlock(pw.value, st.email, st.kdf, st.protectedKey));
-        await loadVault();
+        const opened = await Promise.all(todo.map((a) =>
+          bw.unlock(pw.value, a.email, a.kdf, a.protectedKey).then((k) => setKey(a, k).then(() => true), () => false)));
+        if (!opened.includes(true)) throw new Error('Wrong master password');
+        const problems = await loadVaults();
+        vaultView();
+        if (problems) status(problems);
       });
     },
-  }, field(`Master password for ${st.email}`, pw), btn, err);
-  app.replaceChildren(title('BW Lite'), form, h('button', { className: 'link', onclick: logout }, 'Log out'));
+  },
+    field(`Master password${todo.length > 1 ? ' (tried on every locked vault)' : ''}`, pw),
+    h('p', { className: 'muted' }, `Locked: ${todo.map((a) => a.label).join(', ')}`),
+    h('div', { className: 'inline' }, btn, unlocked().length && h('button', { type: 'button', onclick: vaultView }, 'Skip')), err);
+  app.replaceChildren(title('BW Lite'), form, h('button', { className: 'link', onclick: accountsView }, 'Vaults'));
   pw.focus();
 }
 
-async function logout() {
-  await local.clear();
-  // same device id avoids new-device emails
-  await local.set({ deviceId: st.deviceId, server: st.server, email: st.email, neverLock: st.neverLock });
-  await session.clear();
-  st = await local.get(null);
-  loginView();
+function accountsView() {
+  const rows = accounts.map((a, i) => {
+    const label = h('input', { value: a.label, title: 'Label shown on this vault\'s items', onchange: () => update(a, { label: label.value.trim() || a.email }) });
+    const remove = h('button', {
+      title: 'Log out and remove this vault from BW Lite',
+      onclick: () => (remove.textContent === 'Sure?' ? removeAccount(a) : (remove.textContent = 'Sure?')),
+    }, 'Remove');
+    return h('div', { className: 'row' },
+      h('div', { className: 'info' }, label, h('small', {}, `${a.email} · ${new URL(a.server).host}${keys[a.id] ? '' : ' · locked'}`)),
+      h('div', { className: 'actions' },
+        h('button', { title: 'Higher autofill priority', disabled: i === 0, onclick: () => move(i, -1) }, '↑'),
+        h('button', { title: 'Lower autofill priority', disabled: i === accounts.length - 1, onclick: () => move(i, 1) }, '↓'),
+        remove));
+  });
+  app.replaceChildren(title('Vaults'),
+    h('p', { className: 'muted' }, 'Order is the autofill priority: the first vault with a login for the site fills.'),
+    h('div', { className: 'list' }, rows),
+    h('div', { className: 'inline' },
+      h('button', { className: 'primary', onclick: loginView }, 'Add vault'),
+      h('button', { onclick: () => (unlocked().length ? vaultView() : unlockView()) }, 'Done')));
 }
 
-const strip = ({ raw, key, notes, ...listFields }) => listFields;
-const byName = (a, b) => a.name.localeCompare(b.name);
-
-// The decrypted list also lives in session storage (memory only, cleared with the key on lock or browser quit),
-// so an unlocked popup opens with one read + JSON.parse. The encrypted copy in local storage serves unlock;
-// persist rewrites it when the items changed.
-async function setVault(items, persist = true) {
-  vault = items;
-  const list = JSON.stringify(items);
-  await Promise.all([session.set({ list }), persist && local.set({ index: await bw.encrypt(list, userKey) })]);
+async function move(i, d) {
+  [accounts[i], accounts[i + d]] = [accounts[i + d], accounts[i]];
+  await saveAccounts();
+  accountsView();
 }
 
-// Manual (Sync button / Ctrl+S), except when there is no local data yet. Unchanged items aren't decrypted again.
-async function syncVault() {
-  const sync = await bw.api(sess(), '/sync?excludeDomains=true');
-  const items = (await bw.decryptVault(sync, userKey, new Map(vault.map((i) => [i.id, i])))).map(strip);
-  const ids = sync.ciphers.map((c) => c.id), keep = new Set(ids);
-  const { ids: old = [] } = await local.get('ids');
-  // raw ciphers stored one key per item so editing reads just the one it needs; 'sync' is the pre-0.2 layout
-  await local.remove(['sync', 'revision', ...old.filter((id) => !keep.has(id)).map((id) => `c:${id}`)]);
-  await local.set({ profile: sync.profile, ids, ...Object.fromEntries(sync.ciphers.map((c) => [`c:${c.id}`, c])) });
-  await setVault(items);
-  await save({ lastSync: Date.now() });
-  vaultView();
+async function removeAccount(a) {
+  const p = `${a.id}:`;
+  const { [`${p}ids`]: ids = [] } = await local.get(`${p}ids`);
+  await local.remove([`${p}index`, `${p}ids`, `${p}profile`, ...ids.map((id) => `${p}c:${id}`)]);
+  await session.remove([`${p}key`, `${p}list`]);
+  accounts = accounts.filter((x) => x !== a);
+  delete keys[a.id];
+  delete lists[a.id];
+  await saveAccounts();
+  merge();
+  if (accounts.length) accountsView();
+  else loginView();
 }
 
-async function loadVault() {
-  const { index, ids } = await local.get(['index', 'ids']);
-  if (!index || !ids) return syncVault();
-  await setVault(JSON.parse(new TextDecoder().decode(await bw.decrypt(index, userKey))), false);
-  vaultView();
+async function lockAll() {
+  keys = {};
+  lists = {};
+  vault = [];
+  for (const a of accounts) delete a.persistKey;
+  await Promise.all([session.clear(), saveAccounts()]);
+  unlockView();
 }
 
-async function fullItem(raw) {
-  const { profile } = await local.get('profile');
-  return (await bw.decryptVault({ profile, ciphers: [raw] }, userKey))[0];
+async function fullItem(a, raw) {
+  const { [`${a.id}:profile`]: profile } = await local.get(`${a.id}:profile`);
+  return { ...(await bw.decryptVault({ profile, ciphers: [raw] }, keys[a.id]))[0], a: a.id };
 }
 
 // The list only holds what it shows; editing needs the raw cipher and its key.
 async function openEdit(i) {
-  const k = `c:${i.id}`;
-  editView(await fullItem((await local.get(k))[k]));
+  const k = `${i.a}:c:${i.id}`;
+  editView(await fullItem(acct(i.a), (await local.get(k))[k]));
 }
 
 // Applies a saved cipher from the server's reply locally, no full sync needed.
-async function storeCipher(raw) {
-  const { ids } = await local.get('ids');
-  await local.set({ [`c:${raw.id}`]: raw, ids: ids.includes(raw.id) ? ids : [...ids, raw.id] });
-  await setVault([...vault.filter((i) => i.id !== raw.id), strip(await fullItem(raw))].sort(byName));
+async function storeCipher(a, raw) {
+  const p = `${a.id}:`;
+  const { [`${p}ids`]: ids = [] } = await local.get(`${p}ids`);
+  await local.set({ [`${p}c:${raw.id}`]: raw, [`${p}ids`]: ids.includes(raw.id) ? ids : [...ids, raw.id] });
+  await setList(a, [...lists[a.id].filter((i) => i.id !== raw.id), strip(await fullItem(a, raw))].sort(byName));
+  merge();
 }
 
 function status(msg) {
@@ -229,12 +341,20 @@ function totpButton(item) {
 setInterval(() => document.querySelectorAll('.totp').forEach((b) => b.textContent !== 'Copied' && b._tick?.()), 1000);
 
 function vaultView() {
-  const q = h('input', { type: 'search', placeholder: 'Search vault', value: query, oninput: () => ((query = q.value), draw()) });
+  const multi = accounts.length > 1;
+  let top; // the login autofill uses: first match in vault order; Enter fills it
+  const q = h('input', {
+    type: 'search', placeholder: 'Search vault', value: query,
+    oninput: () => ((query = q.value), draw()),
+    onkeydown: (e) => e.key === 'Enter' && top && fill(top),
+  });
   const list = h('div', { className: 'list' });
   const row = (i) => h('div', { className: 'row' },
-    h('div', { className: 'info', title: 'Edit', onclick: () => openEdit(i).catch((e) => status(e.message)) }, h('b', {}, i.name || '(no name)'), h('small', {}, i.username)),
+    h('div', { className: 'info', title: 'Edit', onclick: () => openEdit(i).catch((e) => status(e.message)) },
+      h('b', {}, i.name || '(no name)'),
+      h('small', {}, multi && h('span', { className: 'tag' }, acct(i.a)?.label), i.username)),
     h('div', { className: 'actions' },
-      host && bw.matches(i, host) && h('button', { className: 'primary', onclick: () => fill(i) }, 'Fill'),
+      host && bw.matches(i, host) && h('button', { className: i === top ? 'primary' : '', title: i === top ? 'Fill (Enter)' : 'Fill', onclick: () => fill(i) }, 'Fill'),
       i.username && h('button', { title: 'Copy username', onclick: (e) => copy(e.target, i.username) }, 'User'),
       i.password && h('button', { title: 'Copy password', onclick: (e) => copy(e.target, i.password) }, 'Pass'),
       i.totp && totpButton(i)));
@@ -242,28 +362,38 @@ function vaultView() {
     const s = q.value.trim().toLowerCase();
     const items = s
       ? vault.filter((i) => `${i.name} ${i.username} ${i.uris.join(' ')}`.toLowerCase().includes(s))
-      : vault.filter((i) => !host || bw.matches(i, host));
+      : host ? vault.filter((i) => bw.matches(i, host)).sort((x, y) => rank(x.a) - rank(y.a)) : vault;
+    top = host && items[0] && bw.matches(items[0], host) ? items[0] : null;
     list.replaceChildren(...(items.length
       ? items.slice(0, 50).map(row)
       : [h('p', { className: 'muted' }, s ? 'No matches' : 'No logins for this site. Type to search.')]));
   };
-  const lock = async () => (await Promise.all([session.remove(['userKey', 'list']), local.remove('persistKey')]), unlockView());
+  const last = Math.min(...unlocked().map((a) => a.lastSync || 0));
+  const ago = last ? Math.round((Date.now() - last) / 60e3) : null;
+  const syncBtn = h('button', {
+    id: 'sync', title: `Sync now (Ctrl+S)${ago == null ? '' : ` · last synced ${ago < 1 ? 'just now' : ago < 120 ? `${ago} min ago` : `${Math.round(ago / 60)} h ago`}`}`,
+    onclick: () => ((syncBtn.textContent = 'Syncing…'), run(syncBtn, document.getElementById('status'), syncAll).finally(() => (syncBtn.textContent = 'Sync'))),
+  }, 'Sync');
   const neverLock = h('input', {
     type: 'checkbox', checked: !!st.neverLock,
     onchange: async () => {
-      await save({ neverLock: neverLock.checked });
-      await (neverLock.checked ? local.set({ persistKey: bw.b64(userKey) }) : local.remove('persistKey'));
+      await local.set({ neverLock: (st.neverLock = neverLock.checked) });
+      for (const a of accounts) {
+        if (st.neverLock && keys[a.id]) a.persistKey = bw.b64(keys[a.id]);
+        else delete a.persistKey;
+      }
+      await saveAccounts();
     },
   });
-  const ago = st.lastSync ? Math.round((Date.now() - st.lastSync) / 60e3) : null;
-  const syncBtn = h('button', {
-    id: 'sync', title: `Sync now (Ctrl+S)${ago == null ? '' : ` · last synced ${ago < 1 ? 'just now' : ago < 120 ? `${ago} min ago` : `${Math.round(ago / 60)} h ago`}`}`,
-    onclick: () => ((syncBtn.textContent = 'Syncing…'), run(syncBtn, document.getElementById('status'), syncVault).finally(() => (syncBtn.textContent = 'Sync'))),
-  }, 'Sync');
+  const stillLocked = locked().length;
   app.replaceChildren(
-    h('header', {}, q, h('button', { title: 'Add login', onclick: () => editView(null) }, '+'), syncBtn, h('button', { onclick: lock }, 'Lock'), themeButton()),
+    h('header', {}, q, h('button', { title: 'Add login', onclick: () => editView(null) }, '+'), syncBtn, h('button', { onclick: lockAll }, 'Lock'), themeButton()),
     list, h('p', { id: 'status', className: 'err' }),
-    h('footer', {}, h('label', { className: 'check', title: 'Keeps the vault key on this computer so the vault stays open after a browser restart. Anyone with access to this browser profile can then open your vault.' }, neverLock, 'Never lock')));
+    h('footer', {},
+      h('label', { className: 'check', title: 'Keeps the vault keys on this computer so the vaults stay open after a browser restart. Anyone with access to this browser profile can then open them.' }, neverLock, 'Never lock'),
+      h('span', {},
+        stillLocked > 0 && h('button', { className: 'link', onclick: unlockView }, `${stillLocked} locked`),
+        h('button', { className: 'link', onclick: accountsView }, multi ? `Vaults (${accounts.length})` : 'Vaults'))));
   draw();
   q.focus();
 }
@@ -280,6 +410,7 @@ function editView(item) {
   const totp = h('input', { value: item?.totp || '', placeholder: 'Secret or otpauth:// URI' });
   const uris = h('textarea', { rows: 2, value: (item ? item.uris : host ? [new URL(tab.url).origin] : []).join('\n'), placeholder: 'One URL per line' });
   const notes = h('textarea', { rows: 3, value: item?.notes || '' });
+  const target = !item && unlocked().length > 1 && h('select', {}, unlocked().map((a) => h('option', { value: a.id }, a.label)));
   const readOnly = item?.raw.edit === false;
   const btn = h('button', { className: 'primary', disabled: readOnly }, readOnly ? 'Read-only' : 'Save');
   const err = h('p', { className: 'err' });
@@ -288,7 +419,8 @@ function editView(item) {
       e.preventDefault();
       run(btn, err, async () => {
         if (totp.value.trim()) await bw.totp(totp.value.trim()); // reject a bad secret before saving it
-        await storeCipher(await bw.saveCipher(sess(), userKey, item, {
+        const a = acct(item?.a || (target ? target.value : unlocked()[0].id));
+        await storeCipher(a, await bw.saveCipher(sess(a), keys[a.id], item, {
           name: name.value.trim(), username: user.value, password: pass.value, totp: totp.value.trim(), notes: notes.value,
           uris: uris.value.split('\n').map((u) => u.trim()).filter(Boolean),
         }));
@@ -296,13 +428,15 @@ function editView(item) {
       });
     },
   },
+    target && field('Vault', target),
     field('Name', name), field('Username', user),
     field('Password', h('div', { className: 'inline' }, pass,
       h('button', { type: 'button', onclick: () => (pass.type = pass.type === 'password' ? 'text' : 'password') }, 'Show'),
       h('button', { type: 'button', onclick: () => ((pass.value = genPassword()), (pass.type = 'text')) }, 'Gen'))),
     field('TOTP', totp), field('URLs', uris), field('Notes', notes),
     h('div', { className: 'inline' }, btn, h('button', { type: 'button', onclick: vaultView }, 'Cancel')), err);
-  app.replaceChildren(title(item ? 'Edit login' : 'Add login'), form);
+  const vaultName = item && accounts.length > 1 && acct(item.a)?.label;
+  app.replaceChildren(title(item ? 'Edit login' : 'Add login'), vaultName && h('p', { className: 'muted' }, `Vault: ${vaultName}`), form);
   name.focus();
 }
 

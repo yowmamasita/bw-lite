@@ -1,7 +1,8 @@
 # BW Lite
 
 A minimal, unofficial Chrome extension for Bitwarden and Vaultwarden. It does five things: search your logins, copy
-them, autofill the current page, show TOTP codes, and add or edit logins. Nothing else.
+them, autofill the current page, show TOTP codes, and add or edit logins. Nothing else. Any number of accounts
+(bitwarden.com, bitwarden.eu, self-hosted, mixed) show up as one list.
 
 About 500 lines of plain JavaScript, no build step, no framework. The only third-party code is
 [hash-wasm](https://github.com/Daninet/hash-wasm) (MIT), loaded only for accounts that use Argon2id.
@@ -23,6 +24,11 @@ the Chrome Web Store, so use the zip there; the `.crx` is for Chromium builds an
 - **Server**: `https://vault.bitwarden.com` (or `https://vault.bitwarden.eu`) for the cloud, else your self-hosted URL.
 - **Logins for the current site** show up when you open the popup; type to search everything.
 - **Fill** fills the username and password on the page and copies the TOTP code, if the login has one.
+- **Several vaults**: add more under **Vaults**. Their logins merge into one list, each tagged with its vault's label
+  (editable there). The order on that page is the autofill priority: the first vault with a login for the site provides
+  the highlighted **Fill**, which **Enter** triggers; a vault without one falls through to the next. One password box
+  unlocks every vault that uses that password; the others stay locked until you enter theirs. Sync, Lock and Never lock
+  apply to all vaults.
 - **Click a login** to edit it, **+** to add one (prefilled with the current site). **Gen** makes a 20-character password.
 - **Sync** is manual: the Sync button or **Ctrl/Cmd+S** (hover it for the last sync time). It only runs by itself at
   first login. Saving a login updates the local copy from the server's reply, no full sync needed.
