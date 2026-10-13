@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "description": "Minimal unofficial Bitwarden/Vaultwarden client: search, copy, autofill, TOTP, add and edit logins.",
   "homepage_url": "https://github.com/yowmamasita/bw-lite",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp0GywNNCIZoYfioyrV51xUuxMfPZU23/diSfHxfa9O/oYSxm8N4iTxC8Eui/ucyGdXS+X7jEm1TFL0eujbNJr8lerKlC6XNzpyPbvSVUxMjEDVP0yZx6bkYdxd9tvp6gRS/e2LqwFYMWpWyD9IDBng8oNDW/XkusIDTnbwjTAD36wpKMl01bm0pzw5l5WTsmeGqrOiW/4baD6wyHswULec5gP6MMTJGZCge0/EwhuLeQ91m78MLHkdRGtcW4tueDvoV5941Z00AsLy80mVz+vlrmhP0CShDcaGCzGGipX9eTsTM09YEsv2nZfFAIYbJLpXgJkQg/pKT89WVBZQea1QIDAQAB",
   "minimum_chrome_version": "102",
   "icons": {
     "16": "icons/16.png",
