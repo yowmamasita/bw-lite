@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BW Lite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Minimal unofficial Bitwarden/Vaultwarden client: search, copy, autofill, TOTP, add and edit logins.",
   "homepage_url": "https://github.com/yowmamasita/bw-lite",
   "minimum_chrome_version": "102",

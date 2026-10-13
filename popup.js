@@ -49,22 +49,24 @@ async function run(btn, err, fn) {
 
 async function start() {
   // small settings only; the encrypted index and raw ciphers are read when needed
-  const keys = ['server', 'email', 'kdf', 'protectedKey', 'tokens', 'deviceId', 'lastSync'];
+  const keys = ['server', 'email', 'kdf', 'protectedKey', 'tokens', 'deviceId', 'lastSync', 'neverLock', 'persistKey'];
   let k, list;
   [st, { userKey: k, list }, [tab]] = await Promise.all([
     local.get(keys), session.get(['userKey', 'list']), chrome.tabs.query({ active: true, currentWindow: true })]);
   host = /^https?:/.test(tab?.url) ? new URL(tab.url).hostname : null;
   if (!st.protectedKey) return loginView();
-  if (!k) return unlockView();
-  userKey = bw.unb64(k);
+  if (!k && !st.persistKey) return unlockView();
+  userKey = bw.unb64(k || st.persistKey);
   if (!list) return loadVault();
   vault = JSON.parse(list);
   vaultView();
 }
 
+// "Never lock" (like Bitwarden's Never timeout) also keeps the key in local storage so it survives a browser restart.
 async function setKey(key) {
   userKey = key;
-  await session.set({ userKey: bw.b64(key) });
+  const k = bw.b64(key);
+  await Promise.all([session.set({ userKey: k }), st.neverLock && local.set({ persistKey: k })]);
 }
 
 function loginView() {
@@ -120,7 +122,8 @@ function unlockView() {
 
 async function logout() {
   await local.clear();
-  await local.set({ deviceId: st.deviceId, server: st.server, email: st.email }); // same device id avoids new-device emails
+  // same device id avoids new-device emails
+  await local.set({ deviceId: st.deviceId, server: st.server, email: st.email, neverLock: st.neverLock });
   await session.clear();
   st = await local.get(null);
   loginView();
@@ -244,7 +247,14 @@ function vaultView() {
       ? items.slice(0, 50).map(row)
       : [h('p', { className: 'muted' }, s ? 'No matches' : 'No logins for this site. Type to search.')]));
   };
-  const lock = async () => (await session.remove(['userKey', 'list']), unlockView());
+  const lock = async () => (await Promise.all([session.remove(['userKey', 'list']), local.remove('persistKey')]), unlockView());
+  const neverLock = h('input', {
+    type: 'checkbox', checked: !!st.neverLock,
+    onchange: async () => {
+      await save({ neverLock: neverLock.checked });
+      await (neverLock.checked ? local.set({ persistKey: bw.b64(userKey) }) : local.remove('persistKey'));
+    },
+  });
   const ago = st.lastSync ? Math.round((Date.now() - st.lastSync) / 60e3) : null;
   const syncBtn = h('button', {
     id: 'sync', title: `Sync now (Ctrl+S)${ago == null ? '' : ` · last synced ${ago < 1 ? 'just now' : ago < 120 ? `${ago} min ago` : `${Math.round(ago / 60)} h ago`}`}`,
@@ -252,7 +262,8 @@ function vaultView() {
   }, 'Sync');
   app.replaceChildren(
     h('header', {}, q, h('button', { title: 'Add login', onclick: () => editView(null) }, '+'), syncBtn, h('button', { onclick: lock }, 'Lock'), themeButton()),
-    list, h('p', { id: 'status', className: 'err' }));
+    list, h('p', { id: 'status', className: 'err' }),
+    h('footer', {}, h('label', { className: 'check', title: 'Keeps the vault key on this computer so the vault stays open after a browser restart. Anyone with access to this browser profile can then open your vault.' }, neverLock, 'Never lock')));
   draw();
   q.focus();
 }

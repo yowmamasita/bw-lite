@@ -26,7 +26,9 @@ the Chrome Web Store, so use the zip there; the `.crx` is for Chromium builds an
 - **Click a login** to edit it, **+** to add one (prefilled with the current site). **Gen** makes a 20-character password.
 - **Sync** is manual: the Sync button or **Ctrl/Cmd+S** (hover it for the last sync time). It only runs by itself at
   first login. Saving a login updates the local copy from the server's reply, no full sync needed.
-- **Day / Night** toggles the theme. **Lock** forgets the key until you unlock again.
+- **Never lock** (checkbox under the list) keeps the vault open across browser restarts, like Bitwarden's "Never"
+  vault timeout. Off by default: the vault then locks when the browser quits.
+- **Day / Night** toggles the theme. **Lock** locks right away, even with Never lock on.
 
 Two-step login supports authenticator apps and Bitwarden's emailed new-device codes.
 
@@ -41,6 +43,8 @@ opened the page, unlock is the account's key derivation (about 260 ms for PBKDF2
 - Your master password never leaves the popup; the server only sees the standard Bitwarden password hash.
 - The decrypted key and the decrypted login list live in `chrome.storage.session`, which Chrome keeps in memory only
   and never exposes to web pages. Locking or quitting the browser clears them.
+- With **Never lock** on, the vault key is also written to `chrome.storage.local` unencrypted, exactly like
+  Bitwarden's own "Never" timeout: anyone who can read this browser profile can open your vault. Lock removes it.
 - On disk (`chrome.storage.local`) everything stays encrypted with your vault key: the raw items as the server sent them
   and an encrypted copy of the login list used to unlock quickly. The refresh token is stored there too, as in the
   official extension.
