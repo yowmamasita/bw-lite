@@ -37,14 +37,21 @@ input[type="checkbox"]:checked { background: var(--fg); border-color: var(--fg);
 .info input { padding: 3px 6px; font-weight: 600; }
 .muted { margin: 0 0 10px; }
 .list + .inline { margin-top: 10px; }
+.inline + .inline { margin-top: 6px; }
 .bar { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
 .brand { font-weight: 700; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
 .bar nav { display: flex; gap: 2px; }
 button.quiet { border: 0; padding: 2px 5px; background: none; color: var(--muted); font-size: 11px; }
 button.quiet:hover:not(:disabled) { background: none; color: var(--fg); text-decoration: underline; }
 .context { color: var(--muted); font-size: 11px; margin: 0 0 4px; }
-.group { margin-top: 10px; padding-bottom: 3px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group { display: flex; justify-content: space-between; gap: 10px; margin-top: 10px; padding-bottom: 3px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; }
+.group > span { overflow: hidden; text-overflow: ellipsis; }
 .group:first-child { margin-top: 4px; }
 .info small { display: flex; gap: 8px; align-items: center; }
-.vault { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.vault { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 170px; overflow: hidden; text-overflow: ellipsis; text-transform: none; letter-spacing: normal; }
+.vault i { flex: none; width: 7px; height: 7px; }
+.vault span { overflow: hidden; text-overflow: ellipsis; }
+.info small .tag { padding: 0; }
+button.danger { margin-left: auto; color: var(--err); border-color: var(--err); }
+button.danger:hover:not(:disabled) { background: var(--err); border-color: var(--err); color: var(--bg); }
 .info .totp { padding: 0; }

@@ -1,4 +1,5 @@
 import * as bw from './bw.js';
+import { fillTab } from './autofill.js';
 
 const app = document.getElementById('app');
 const local = chrome.storage.local, session = chrome.storage.session; // session = memory only, gone when the browser quits
@@ -7,9 +8,14 @@ const collator = new Intl.Collator();
 
 // accounts: ordered list (the order is the autofill priority) of
 //   { id, server, email, label, kdf, protectedKey, tokens, lastSync, persistKey? }
-// Per account in local storage: `${id}:index` (encrypted list), `${id}:ids`, `${id}:profile`, `${id}:c:${cipherId}` (raw).
+// Per account in local storage: `${id}:index4` (encrypted list; entries carry passkeys, match types, note flag), `${id}:ids`,
+// `${id}:profile`, `${id}:eq` (equivalent domain groups), `${id}:c:${cipherId}` (raw).
 // Per account in session storage: `${id}:key` and `${id}:list` (decrypted list, so an open is a read + JSON.parse).
-let st, accounts = [], keys = {}, lists = {}, vault = [], tab, host, query = '';
+let st, accounts = [], keys = {}, lists = {}, vault = [], equiv = new Map(), tab, host, pageUrl, query = '', wide = false;
+// Opened by background.js for a page: #pk=<key> a passkey request (own window), #save=<key> the save bar (a frame in
+// the page, see inpage.js). pk / sv: that request, from session storage.
+const [mode, modeKey] = location.hash.slice(1).split('=');
+let pk, sv;
 
 function h(tag, props = {}, ...kids) {
   const el = document.createElement(tag);
@@ -30,7 +36,12 @@ const acct = (id) => accounts.find((a) => a.id === id);
 const unlocked = () => accounts.filter((a) => keys[a.id]);
 const locked = () => accounts.filter((a) => !keys[a.id]);
 const rank = (id) => accounts.findIndex((a) => a.id === id);
-const strip = ({ raw, key, notes, ...listFields }) => listFields;
+const strip = ({ raw, key, notes, ...listFields }) => (notes ? { ...listFields, note: true } : listFields);
+// One color per vault, by its place in the vault order.
+const COLORS = ['#4f9dff', '#f0a03c', '#3fbf7f', '#c678dd', '#e5605a'];
+const vaultTag = (id) => h('span', { className: 'vault', title: 'Vault' }, h('i', { style: `background: ${COLORS[rank(id) % COLORS.length]}` }), h('span', {}, acct(id)?.label));
+// used: { 'account:cipher': time of last fill or passkey sign-in }, kept on this computer only, like Bitwarden's last used.
+const markUsed = (i) => local.set({ used: (st.used = { ...st.used, [`${i.a}:${i.id}`]: Date.now() }) });
 const byName = (a, b) => collator.compare(a.name, b.name) || collator.compare(a.username, b.username);
 
 // Night (default) / day toggle; the choice is a per-browser convenience, so localStorage is enough.
@@ -65,9 +76,20 @@ async function run(btn, err, fn) {
 async function start() {
   let s;
   [st, s, [tab]] = await Promise.all([
-    local.get(['accounts', 'deviceId', 'neverLock', 'server', 'email', 'kdf', 'protectedKey', 'tokens', 'persistKey']),
+    local.get(['accounts', 'used', 'deviceId', 'neverLock', 'server', 'email', 'kdf', 'protectedKey', 'tokens', 'persistKey']),
     session.get(null), chrome.tabs.query({ active: true, currentWindow: true })]);
-  host = /^https?:/.test(tab?.url) ? new URL(tab.url).hostname : null;
+  if (mode === 'pk') {
+    if (!(pk = s[`pk:${modeKey}`])) return window.close();
+    tab = { id: pk.tabId, url: pk.origin };
+    addEventListener('pagehide', () => answer(CANCEL)); // closing the window cancels
+  }
+  if (mode === 'save') {
+    if (!(sv = s[`save:${modeKey}`])) return;
+    tab = { url: sv.origin };
+    new ResizeObserver(() => parent.postMessage({ bwliteBar: 'size', height: document.body.scrollHeight }, '*')).observe(document.body);
+  } else if (window !== top) return; // a web page framing this page gets nothing
+  pageUrl = /^https?:/.test(tab?.url) ? tab.url : null;
+  host = pageUrl && new URL(pageUrl).hostname;
   if (!st.accounts && st.protectedKey) s = await migrate();
   accounts = st.accounts || [];
   for (const a of accounts) {
@@ -77,6 +99,7 @@ async function start() {
   if (!accounts.length) return loginView();
   if (!unlocked().length) return unlockView();
   const problems = await loadVaults(s);
+  await loadEquiv();
   vaultView();
   if (problems) status(problems);
 }
@@ -104,7 +127,7 @@ async function setList(a, items, persist = true) {
   const list = JSON.stringify(items);
   await Promise.all([
     session.set({ [`${a.id}:list`]: list }),
-    persist && local.set({ [`${a.id}:index`]: await bw.encrypt(list, keys[a.id]) }),
+    persist && local.set({ [`${a.id}:index4`]: await bw.encrypt(list, keys[a.id]) }),
   ]);
 }
 
@@ -118,13 +141,15 @@ async function loadVaults(s = {}) {
   const todo = unlocked().filter((a) => !lists[a.id]);
   const res = await Promise.allSettled(todo.map(async (a) => {
     if (s[`${a.id}:list`]) return (lists[a.id] = JSON.parse(s[`${a.id}:list`]));
-    const { [`${a.id}:index`]: index } = await local.get(`${a.id}:index`);
-    if (!index) return syncAccount(a);
+    const { [`${a.id}:index4`]: index } = await local.get(`${a.id}:index4`);
+    if (!index) return local.remove([`${a.id}:index`, `${a.id}:index2`, `${a.id}:index3`]).then(() => syncAccount(a));
     await setList(a, JSON.parse(td.decode(await bw.decrypt(index, keys[a.id]))), false);
   }));
   merge();
   return failures(todo, res);
 }
+
+const loadEquiv = async () => (equiv = bw.equivalents(Object.values(await local.get(accounts.map((a) => `${a.id}:eq`))).flat()));
 
 const failures = (todo, res) =>
   res.map((r, i) => r.status === 'rejected' && `${todo[i].label}: ${r.reason.message}`).filter(Boolean).join('\n');
@@ -132,16 +157,19 @@ const failures = (todo, res) =>
 // Manual (Sync button / Ctrl+S), except for an account with no local data yet. Unchanged items aren't decrypted again.
 async function syncAccount(a) {
   const p = `${a.id}:`;
-  const sync = await bw.api(sess(a), '/sync?excludeDomains=true');
+  const sync = await bw.api(sess(a), '/sync');
   const prev = new Map((lists[a.id] || []).map((i) => [i.id, i]));
   const items = (await bw.decryptVault(sync, keys[a.id], prev)).map((i) => ({ ...strip(i), a: a.id }));
   const ids = sync.ciphers.map((c) => c.id), keep = new Set(ids);
   const { [`${p}ids`]: old = [] } = await local.get(`${p}ids`);
   // raw ciphers stored one key per item so editing reads just the one it needs
   await local.remove(old.filter((id) => !keep.has(id)).map((id) => `${p}c:${id}`));
-  await local.set({ [`${p}profile`]: sync.profile, [`${p}ids`]: ids, ...Object.fromEntries(sync.ciphers.map((c) => [`${p}c:${c.id}`, c])) });
+  const d = sync.domains || {};
+  const eq = [...(d.equivalentDomains || []), ...(d.globalEquivalentDomains || []).filter((g) => !g.excluded).map((g) => g.domains)];
+  await local.set({ [`${p}profile`]: sync.profile, [`${p}ids`]: ids, [`${p}eq`]: eq, ...Object.fromEntries(sync.ciphers.map((c) => [`${p}c:${c.id}`, c])) });
   await setList(a, items);
   await update(a, { lastSync: Date.now() });
+  await loadEquiv();
 }
 
 async function syncAll() {
@@ -229,14 +257,14 @@ function accountsView() {
       onclick: () => (remove.textContent === 'Sure?' ? removeAccount(a) : (remove.textContent = 'Sure?')),
     }, 'Remove');
     return h('div', { className: 'row' },
-      h('div', { className: 'info' }, label, h('small', {}, `${a.email} · ${new URL(a.server).host}${keys[a.id] ? '' : ' · locked'}`)),
+      h('div', { className: 'info' }, label, h('small', {}, accounts.length > 1 && vaultTag(a.id), `${a.email} · ${new URL(a.server).host}${keys[a.id] ? '' : ' · locked'}`)),
       h('div', { className: 'actions' },
         h('button', { title: 'Higher autofill priority', disabled: i === 0, onclick: () => move(i, -1) }, '↑'),
         h('button', { title: 'Lower autofill priority', disabled: i === accounts.length - 1, onclick: () => move(i, 1) }, '↓'),
         remove));
   });
   app.replaceChildren(title('Vaults'),
-    h('p', { className: 'muted' }, 'Order is the autofill priority: the first vault with a login for the site fills.'),
+    h('p', { className: 'muted' }, 'Order is the autofill priority: the first vault with a login for the site fills, unless you last used another one there.'),
     h('div', { className: 'list' }, rows),
     h('div', { className: 'inline' },
       h('button', { className: 'primary', onclick: loginView }, 'Add vault'),
@@ -252,7 +280,7 @@ async function move(i, d) {
 async function removeAccount(a) {
   const p = `${a.id}:`;
   const { [`${p}ids`]: ids = [] } = await local.get(`${p}ids`);
-  await local.remove([`${p}index`, `${p}ids`, `${p}profile`, ...ids.map((id) => `${p}c:${id}`)]);
+  await local.remove([`${p}index`, `${p}index2`, `${p}index3`, `${p}index4`, `${p}eq`, `${p}ids`, `${p}profile`, ...ids.map((id) => `${p}c:${id}`)]);
   await session.remove([`${p}key`, `${p}list`]);
   accounts = accounts.filter((x) => x !== a);
   delete keys[a.id];
@@ -268,7 +296,8 @@ async function lockAll() {
   lists = {};
   vault = [];
   for (const a of accounts) delete a.persistKey;
-  await Promise.all([session.clear(), saveAccounts()]);
+  await saveAccounts(); // first, so background.js can't reopen a vault from a persisted key in between
+  await session.clear();
   unlockView();
 }
 
@@ -278,10 +307,11 @@ async function fullItem(a, raw) {
 }
 
 // The list only holds what it shows; editing needs the raw cipher and its key.
-async function openEdit(i) {
+async function loadItem(i) {
   const k = `${i.a}:c:${i.id}`;
-  editView(await fullItem(acct(i.a), (await local.get(k))[k]));
+  return fullItem(acct(i.a), (await local.get(k))[k]);
 }
+const openEdit = async (i) => editView(await loadItem(i));
 
 // Applies a saved cipher from the server's reply locally, no full sync needed.
 async function storeCipher(a, raw) {
@@ -290,6 +320,17 @@ async function storeCipher(a, raw) {
   await local.set({ [`${p}c:${raw.id}`]: raw, [`${p}ids`]: ids.includes(raw.id) ? ids : [...ids, raw.id] });
   await setList(a, [...lists[a.id].filter((i) => i.id !== raw.id), strip(await fullItem(a, raw))].sort(byName));
   merge();
+}
+
+async function deleteItem(item) {
+  const a = acct(item.a), p = `${a.id}:`;
+  await bw.deleteCipher(sess(a), item.id);
+  const { [`${p}ids`]: ids = [] } = await local.get(`${p}ids`);
+  await local.remove(`${p}c:${item.id}`);
+  await local.set({ [`${p}ids`]: ids.filter((id) => id !== item.id) });
+  await setList(a, lists[a.id].filter((i) => i.id !== item.id));
+  merge();
+  vaultView();
 }
 
 function status(msg) {
@@ -304,30 +345,11 @@ async function copy(btn, text) {
   setTimeout(() => (btn.textContent = old), 1000);
 }
 
-// Runs inside the page. Must stay self-contained: it is serialized by chrome.scripting.
-function fillPage(username, password) {
-  const inputs = [...document.querySelectorAll('input')].filter((i) => !i.disabled && !i.readOnly && i.getClientRects().length);
-  const pw = inputs.find((i) => i.type === 'password');
-  const texts = (pw ? inputs.slice(0, inputs.indexOf(pw)) : inputs).filter((i) => ['text', 'email', 'tel'].includes(i.type));
-  const user = pw ? texts.at(-1) : texts.find((i) => i.type === 'email' || /user|email|login/i.test(i.autocomplete + i.name + i.id)) || texts[0];
-  const set = (el, v) => {
-    el.focus();
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  };
-  if (user && username) set(user, username);
-  if (pw && password) set(pw, password);
-  return !!((user && username) || pw);
-}
-
-// ponytail: fills the top frame only; login forms inside iframes aren't reached.
 async function fill(item) {
-  const now = await chrome.tabs.get(tab.id);
-  if (!/^https?:/.test(now.url) || !bw.matches(item, new URL(now.url).hostname)) return status('The tab changed, not filling');
-  const [{ result }] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: fillPage, args: [item.username, item.password] });
-  if (!result) return status('No login form found on this page');
+  const ok = await fillTab(tab.id, item, equiv).catch((e) => status(e.message));
+  if (!ok) return ok === false && status('No login form for this login on the page');
   if (item.totp) await navigator.clipboard.writeText((await bw.totp(item.totp)).code);
+  await markUsed(item);
   window.close();
 }
 
@@ -343,8 +365,10 @@ setInterval(() => document.querySelectorAll('.totp').forEach((b) => b.textConten
 // Layout: top bar (brand + text actions), full-width search, a line saying what the list shows, then logins grouped
 // under their name with the username leading each row. Fill is the only boxed button; the autofill pick is solid.
 function vaultView() {
+  if (pk) return passkeyView();
+  if (sv) return saveView();
   const multi = accounts.length > 1;
-  let top; // the login autofill uses: first match in vault order; Enter fills it
+  let top, here = []; // top: the login autofill uses (first of the site's logins); Enter fills it
   const q = h('input', {
     type: 'search', placeholder: 'Search all logins', value: query,
     oninput: () => ((query = q.value), draw()),
@@ -353,32 +377,39 @@ function vaultView() {
   const context = h('p', { className: 'context' });
   const list = h('div', { className: 'list' });
   const quiet = (text, title, onclick) => h('button', { className: 'quiet', title, onclick }, text);
-  const row = (i, mixed) => h('div', { className: 'row' },
+  const row = (i) => h('div', { className: 'row' },
     h('div', { className: 'info' },
       h('b', { title: i.username }, i.username || '(no username)'),
-      (mixed || i.totp) && h('small', {}, mixed && h('span', { className: 'vault', title: 'Vault' }, acct(i.a)?.label), i.totp && totpButton(i))),
+      (i.totp || i.passkeys || i.note) && h('small', {}, i.totp && totpButton(i), i.passkeys && h('span', {}, 'passkey'),
+        i.note && h('button', { className: 'quiet tag', title: 'Has a note: open it', onclick: () => openEdit(i).catch((e) => status(e.message)) }, 'note'))),
     h('div', { className: 'actions' },
-      host && bw.matches(i, host) && h('button', { className: i === top ? 'primary' : '', title: i === top ? 'Fill (Enter)' : 'Fill', onclick: () => fill(i) }, 'Fill'),
+      here.includes(i) && h('button', { className: i === top ? 'primary' : '', title: i === top ? 'Fill (Enter)' : 'Fill', onclick: () => fill(i) }, 'Fill'),
       i.username && quiet('user', 'Copy username', (e) => copy(e.target, i.username)),
       i.password && quiet('pass', 'Copy password', (e) => copy(e.target, i.password)),
       quiet('edit', 'Edit', () => openEdit(i).catch((e) => status(e.message)))));
   const draw = () => {
     const s = q.value.trim().toLowerCase();
+    here = pageUrl ? bw.forSite(vault, pageUrl, equiv, rank, st.used) : [];
+    const scoped = here.length > 0 && !wide; // a site with logins: search those first, the whole vault on request
+    q.placeholder = scoped ? `Search logins for ${host}` : 'Search all logins';
     const items = s
-      ? vault.filter((i) => `${i.name} ${i.username} ${i.uris.join(' ')}`.toLowerCase().includes(s))
-      : host ? vault.filter((i) => bw.matches(i, host)).sort((x, y) => rank(x.a) - rank(y.a)) : vault;
-    top = host && items[0] && bw.matches(items[0], host) ? items[0] : null;
+      ? (scoped ? here : vault).filter((i) => `${i.name} ${i.username} ${i.uris.join(' ')}`.toLowerCase().includes(s))
+      : host ? here : vault;
+    top = here.includes(items[0]) ? items[0] : null;
     const shown = items.slice(0, 50);
     const n = `${items.length} login${items.length === 1 ? '' : 's'}`;
-    context.textContent = s ? `${items.length ? n : 'No logins'} matching “${q.value.trim()}”${items.length > 50 ? ', first 50 shown' : ''}`
+    context.replaceChildren(s ? `${items.length ? n : 'No logins'}${scoped ? ` for ${host}` : ''} matching “${q.value.trim()}”${items.length > 50 ? ', first 50 shown' : ''}`
       : host ? (items.length ? `${n} for ${host}` : `No logins for ${host}. Type to search.`)
-      : `${n}${items.length > 50 ? ', first 50 shown' : ''}`;
+      : `${n}${items.length > 50 ? ', first 50 shown' : ''}`,
+    s && scoped ? quiet('search whole vault', 'Search all logins, not just this site\'s', () => ((wide = true), draw(), q.focus())) : '');
     const mixed = new Set(shown.map((i) => i.a)).size > 1; // vault names only when they tell rows apart
     const out = [];
     let group;
     for (const i of shown) {
-      if (i.name !== group) out.push(h('div', { className: 'group' }, (group = i.name) || '(no name)'));
-      out.push(row(i, mixed));
+      const g = mixed ? `${i.name}\n${i.a}` : i.name; // same name in two vaults: two groups
+      if (g !== group) out.push(h('div', { className: 'group' }, h('span', {}, i.name || '(no name)'), mixed && vaultTag(i.a)));
+      group = g;
+      out.push(row(i));
     }
     list.replaceChildren(...out);
   };
@@ -431,6 +462,11 @@ function editView(item) {
   const readOnly = item?.raw.edit === false;
   const btn = h('button', { className: 'primary', disabled: readOnly }, readOnly ? 'Read-only' : 'Save');
   const err = h('p', { className: 'err' });
+  // second click confirms; the item goes to the server's trash
+  const del = h('button', {
+    type: 'button', className: 'danger', title: 'Move to the trash (restore it from the Bitwarden web vault)',
+    onclick: () => (del.textContent === 'Sure?' ? run(del, err, () => deleteItem(item)) : (del.textContent = 'Sure?')),
+  }, 'Delete');
   const form = h('form', {
     onsubmit: (e) => {
       e.preventDefault();
@@ -451,10 +487,99 @@ function editView(item) {
       h('button', { type: 'button', onclick: () => (pass.type = pass.type === 'password' ? 'text' : 'password') }, 'Show'),
       h('button', { type: 'button', onclick: () => ((pass.value = genPassword()), (pass.type = 'text')) }, 'Gen'))),
     field('TOTP', totp), field('URLs', uris), field('Notes', notes),
-    h('div', { className: 'inline' }, btn, h('button', { type: 'button', onclick: vaultView }, 'Cancel')), err);
-  const vaultName = item && accounts.length > 1 && acct(item.a)?.label;
-  app.replaceChildren(title(item ? 'Edit login' : 'Add login'), vaultName && h('p', { className: 'muted' }, `Vault: ${vaultName}`), form);
+    h('div', { className: 'inline' }, btn, h('button', { type: 'button', onclick: vaultView }, 'Cancel'), item && !readOnly && del), err);
+  app.replaceChildren(title(item ? 'Edit login' : 'Add login'), item && accounts.length > 1 && h('p', { className: 'muted' }, vaultTag(item.a)), form);
   name.focus();
+}
+
+const CANCEL = { error: { name: 'NotAllowedError', message: 'Cancelled' } };
+
+// Sends the page its answer, once, and closes the window.
+async function answer(res) {
+  if (!pk) return;
+  const { id, tabId, documentId } = pk;
+  pk = null;
+  // the page's own passkey UI needs its window focused
+  if (res.fallback) await chrome.windows.update((await chrome.tabs.get(tabId)).windowId, { focused: true }).catch(() => {});
+  chrome.tabs.sendMessage(tabId, { bwliteRes: id, ...res }, { documentId }).catch(() => {});
+  session.remove(`pk:${modeKey}`);
+  window.close();
+}
+
+// ponytail: user verification is the unlocked vault plus this click; there is no extra master password prompt.
+function passkeyView() {
+  const { kind, rpId, origin, options: o } = pk;
+  const err = h('p', { className: 'err' });
+  const multi = unlocked().length > 1;
+  const pkRow = (text, sub, btn) => h('div', { className: 'row' },
+    h('div', { className: 'info' }, h('b', { title: text }, text), sub && h('small', {}, sub)), h('div', { className: 'actions' }, btn));
+  const action = (text, primary, fn) => {
+    const b = h('button', { type: 'button', className: primary ? 'primary' : '', onclick: () => run(b, err, fn) }, text);
+    return b;
+  };
+  const ids = (list) => new Set((list || []).map((c) => c.id));
+  const mine = vault.flatMap((i) => (i.passkeys || []).filter((p) => p.rpId === rpId).map((p) => ({ i, p, id: bw.b64u(bw.credIdBytes(p.credentialId)) })));
+  const others = h('div', { className: 'inline' },
+    h('button', { type: 'button', onclick: () => answer({ fallback: true }) }, 'Use device or security key'),
+    h('button', { type: 'button', onclick: () => answer(CANCEL) }, 'Cancel'));
+  const show = (heading, text, rows, extra = '') =>
+    app.replaceChildren(title(heading), h('p', { className: 'muted' }, text), h('div', { className: 'list' }, rows), extra, others, err);
+
+  if (kind === 'get') {
+    const allow = ids(o.allowCredentials);
+    const rows = mine.filter((m) => !allow.size || allow.has(m.id)).map(({ i, p }) =>
+      pkRow(p.userName || i.username || '(no username)', `${i.name}${multi ? ` · ${acct(i.a)?.label}` : ''}`,
+        action('Use', true, async () => { const result = await bw.passkeyGet(p, o, origin); await markUsed(i); answer({ result }); })));
+    return show('Sign in with passkey', rows.length ? `Passkeys for ${rpId}:` : `No passkey for ${rpId} in BW Lite.`, rows);
+  }
+
+  const exclude = ids(o.excludeCredentials);
+  if (mine.some((m) => exclude.has(m.id))) return answer({ error: { name: 'InvalidStateError', message: 'This passkey is already saved' } });
+  const save = async (a, item) => {
+    const { passkey, result } = await bw.passkeyCreate(o, origin, rpId);
+    const v = item ? { ...item, passkey }
+      : { name: o.rp.name || rpId, username: o.user.name || '', password: '', totp: '', notes: '', uris: [origin], passkey };
+    await storeCipher(a, await bw.saveCipher(sess(a), keys[a.id], item, v));
+    answer({ result });
+  };
+  // existing logins for the site that have no passkey yet
+  const rows = vault.filter((i) => bw.matches(i, pageUrl, equiv) && !i.passkeys).map((i) =>
+    pkRow(i.username || '(no username)', `${i.name}${multi ? ` · ${acct(i.a)?.label}` : ''}`,
+      action('Save here', false, async () => save(acct(i.a), await loadItem(i)))));
+  const target = multi && h('select', {}, unlocked().map((a) => h('option', { value: a.id }, a.label)));
+  const create = h('div', { className: 'inline' }, target,
+    action('Save as new login', true, () => save(target ? acct(target.value) : unlocked()[0])));
+  show('Save passkey', `Save a passkey for ${o.user.name || 'this account'} on ${rpId}${rows.length ? ', in a new login or an existing one:' : '?'}`, rows, create);
+}
+
+// The "save this login?" bar. sv: { kind: 'add' | 'update', username, password, origin, a?, id? } from background.js.
+function saveView() {
+  const { kind, username, password, origin } = sv;
+  const err = h('p', { className: 'err' });
+  const close = () => (session.remove(`save:${modeKey}`), parent.postMessage({ bwliteBar: 'close' }, '*'));
+  const target = kind === 'add' && unlocked().length > 1 && h('select', {}, unlocked().map((a) => h('option', { value: a.id }, a.label)));
+  const save = h('button', {
+    className: 'primary',
+    onclick: () => run(save, err, async () => {
+      const a = acct(sv.a || (target ? target.value : unlocked()[0].id));
+      const item = kind === 'update' ? await loadItem(sv) : null;
+      await storeCipher(a, await bw.saveCipher(sess(a), keys[a.id], item, item ? { ...item, password }
+        : { name: new URL(origin).hostname, username, password, totp: '', notes: '', uris: [origin] }));
+      close();
+    }),
+  }, kind === 'add' ? 'Save' : 'Update');
+  const never = kind === 'add' && h('button', {
+    title: `Never offer to save logins for ${new URL(origin).hostname}`,
+    onclick: async () => {
+      const { neverSave = [] } = await local.get('neverSave');
+      await local.set({ neverSave: [...neverSave, new URL(origin).hostname] });
+      close();
+    },
+  }, 'Never');
+  app.replaceChildren(
+    h('div', { className: 'bar' }, h('span', { className: 'brand' }, 'BW Lite')),
+    h('p', {}, kind === 'add' ? `Save the login${username ? ` for ${username}` : ''}?` : `Update the password for ${username || 'this login'}?`),
+    h('div', { className: 'inline' }, target, save, never, h('button', { onclick: close }, 'Not now')), err);
 }
 
 document.addEventListener('keydown', (e) => {

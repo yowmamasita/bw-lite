@@ -159,7 +159,8 @@ export async function api(s, path, method = 'GET', body) {
     headers: { ...CLIENT, Authorization: `Bearer ${s.tokens.access}`, ...(body && { 'Content-Type': 'application/json' }) },
   });
   if (!r.ok) throw new Error(`${method} ${path} failed (${r.status}): ${(await r.text()).slice(0, 200)}`);
-  return r.json();
+  const text = await r.text(); // some calls (delete) answer with an empty body
+  return text && JSON.parse(text);
 }
 
 // --- vault --------------------------------------------------------------
@@ -178,7 +179,10 @@ export async function decryptVault(sync, userKey, prev) {
       const l = c.login || {};
       const [name, notes, username, password, totp, ...uris] = await Promise.all(
         [c.name, c.notes, l.username, l.password, l.totp, ...(l.uris || []).map((u) => u.uri)].map((x) => decStr(x, key)));
-      return { id: c.id, rev: c.revisionDate, raw: c, key, name, notes, username, password, totp, uris, d: uris.map(domainOf) };
+      const passkeys = l.fido2Credentials?.length ? await Promise.all(l.fido2Credentials.map(async (f) =>
+        Object.fromEntries(await Promise.all(PASSKEY_FIELDS.map(async (k) => [k, await decStr(f[k], key)]))))) : undefined;
+      const m = l.uris?.some((u) => u.match != null) ? l.uris.map((u) => u.match) : undefined; // per-URI match type, when any is set
+      return { id: c.id, rev: c.revisionDate, raw: c, key, name, notes, username, password, totp, uris, d: uris.map(domainOf), m, passkeys };
     } catch (e) {
       console.warn('Skipping undecryptable item', c.id, e);
     }
@@ -205,6 +209,9 @@ export async function saveCipher(s, userKey, item, v) {
     uriChecksum: await encrypt(b64(await sha256(u)), key), // official clients drop a URI whose checksum doesn't match
     match: item?.raw.login?.uris?.[item.uris.indexOf(u)]?.match ?? null,
   })));
+  // one passkey per login, as in the official clients: saving one replaces the old
+  if (v.passkey) c.login.fido2Credentials = [{
+    ...Object.fromEntries(await Promise.all(PASSKEY_FIELDS.map(async (k) => [k, await e(v.passkey[k])]))), creationDate: v.passkey.creationDate }];
   delete c.login.uri; // legacy single-URI field; the server would append it to uris
   if (c.attachments) c.attachments2 = Object.fromEntries(c.attachments.map((a) => [a.id, { fileName: a.fileName, key: a.key }]));
   delete c.attachments;
@@ -215,6 +222,9 @@ export async function saveCipher(s, userKey, item, v) {
   return api(s, `/ciphers/${item.id}`, 'PUT', c);
 }
 
+// Moves an item to the trash, as the official clients' Delete does (restorable there for 30 days).
+export const deleteCipher = (s, id) => api(s, `/ciphers/${id}/delete`, 'PUT');
+
 // ponytail: base domain without the public suffix list; covers co.uk-style suffixes only. Add a PSL if it mismatches.
 export function baseDomain(host) {
   if (/^[\d.]+$/.test(host) || host.includes(':')) return host;
@@ -222,16 +232,109 @@ export function baseDomain(host) {
   return p.slice(/^(co|com|net|org|gov|ac|edu)$/.test(p.at(-2)) && p.at(-1).length === 2 ? -3 : -2).join('.');
 }
 
+const toURL = (u) => new URL(/^[a-z][\w+.-]*:\/\//i.test(u) ? u : `https://${u}`);
+
 export function domainOf(u) {
   try {
-    return baseDomain(new URL(/^[a-z][\w+.-]*:\/\//i.test(u) ? u : `https://${u}`).hostname);
+    return baseDomain(toURL(u).hostname);
   } catch {
     return null;
   }
 }
 
-// item.d: domains precomputed by decryptVault, so matching a big vault doesn't parse every URL again.
-export const matches = (item, host) => (item.d || item.uris.map(domainOf)).includes(baseDomain(host));
+// groups: lists of domains the server treats as one site (sync.domains). Returns domain -> every domain it equals.
+export function equivalents(groups) {
+  const m = new Map();
+  for (const g of groups) for (const d of g) m.set(d, new Set([...(m.get(d) || []), ...g]));
+  return m;
+}
+
+// Per saved URI, its match type as in Bitwarden: null/0 base domain (or an equivalent one), 1 host (with port),
+// 2 starts with, 3 exact, 4 regular expression, 5 never. item.d: domains precomputed by decryptVault.
+export function matches(item, url, equiv) {
+  const page = new URL(url), site = baseDomain(page.hostname);
+  return item.uris.some((u, n) => {
+    try {
+      switch (item.m?.[n] ?? 0) {
+        case 0: { const d = item.d ? item.d[n] : domainOf(u); return d === site || !!equiv?.get(site)?.has(d); }
+        case 1: return toURL(u).host === page.host;
+        case 2: return url.startsWith(u);
+        case 3: return url === u;
+        case 4: return new RegExp(u, 'i').test(url);
+        default: return false;
+      }
+    } catch {
+      return false;
+    }
+  });
+}
+
+// The logins for a page, best first: last used (used: {'account:cipher': time}), then vault order (rank).
+export const forSite = (items, url, equiv, rank, used = {}) => items.filter((i) => matches(i, url, equiv))
+  .sort((x, y) => (used[`${y.a}:${y.id}`] || 0) - (used[`${x.a}:${x.id}`] || 0) || rank(x.a) - rank(y.a));
+
+// --- passkeys (WebAuthn, ES256 only) --------------------------------------
+// Stored as the official clients store them (login.fido2Credentials, every field an EncString), so a passkey made here
+// works there and back. Requests and results use the WebAuthn JSON shapes: binary values are base64url strings.
+
+const PASSKEY_FIELDS = ['credentialId', 'keyType', 'keyAlgorithm', 'keyCurve', 'keyValue', 'rpId', 'rpName', 'userHandle',
+  'userName', 'userDisplayName', 'counter', 'discoverable'];
+export const b64u = (buf) => b64(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = (s) => unb64(s.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(s.length / 4) * 4, '='));
+// Official clients give passkeys they create a GUID id and imported ones 'b64.' + base64url.
+export const credIdBytes = (id) =>
+  id.startsWith('b64.') ? unb64u(id.slice(4)) : Uint8Array.from(id.replace(/-/g, '').match(/../g), (x) => parseInt(x, 16));
+const cborBytes = (b) => concat(b.length < 24 ? [0x40 + b.length] : b.length < 256 ? [0x58, b.length] : [0x59, b.length >> 8, b.length & 255], b);
+const cborText = (s) => concat([0x60 + s.length], te.encode(s)); // short ASCII keys only
+const toJSON = (r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof ArrayBuffer || ArrayBuffer.isView(v) ? b64u(v) : v]));
+const clientData = (type, o, origin) => te.encode(JSON.stringify({ type, challenge: o.challenge, origin, crossOrigin: false }));
+// The signature counter stays 0 (allowed by WebAuthn), so signing in never writes to the vault.
+const authData = async (rpId, flags, extra = []) => concat(await sha256(rpId), [flags, 0, 0, 0, 0], extra);
+const UP_UV_BE_BS = 0x1d, AT = 0x40; // user present + verified, backup eligible + backed up (synced), attested data
+
+// WebCrypto signs ECDSA as r|s; WebAuthn wants DER.
+function der(sig) {
+  const int = (b) => {
+    let i = 0;
+    while (i < b.length - 1 && !b[i]) i++;
+    b = b.slice(i);
+    return concat([2, b.length + (b[0] >> 7)], b[0] >> 7 ? [0] : [], b);
+  };
+  const body = concat(int(sig.slice(0, 32)), int(sig.slice(32)));
+  return concat([0x30, body.length], body);
+}
+
+// o: PublicKeyCredentialCreationOptions as JSON. Returns the passkey to store and the result for the page.
+export async function passkeyCreate(o, origin, rpId) {
+  const kp = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+  const id = crypto.randomUUID(), rawId = credIdBytes(id);
+  const pub = new Uint8Array(await subtle.exportKey('raw', kp.publicKey)); // 04 | x | y
+  const cose = concat([0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 32], pub.slice(1, 33), [0x22, 0x58, 32], pub.slice(33)); // EC2, ES256, P-256
+  const auth = await authData(rpId, UP_UV_BE_BS | AT, concat(new Uint8Array(16), [0, rawId.length], rawId, cose)); // zero AAGUID
+  const att = concat([0xa3], cborText('fmt'), cborText('none'), cborText('attStmt'), [0xa0], cborText('authData'), cborBytes(auth));
+  const passkey = {
+    credentialId: id, keyType: 'public-key', keyAlgorithm: 'ECDSA', keyCurve: 'P-256', keyValue: b64u(await subtle.exportKey('pkcs8', kp.privateKey)),
+    rpId, rpName: o.rp.name, userHandle: o.user.id, userName: o.user.name, userDisplayName: o.user.displayName,
+    counter: '0', discoverable: 'true', creationDate: new Date().toISOString(),
+  };
+  const response = toJSON({
+    clientDataJSON: clientData('webauthn.create', o, origin), attestationObject: att, authenticatorData: auth,
+    publicKey: await subtle.exportKey('spki', kp.publicKey), publicKeyAlgorithm: -7, transports: ['internal', 'hybrid'],
+  });
+  const ext = o.extensions?.credProps ? { credProps: { rk: true } } : {};
+  return { passkey, result: { id: b64u(rawId), rawId: b64u(rawId), type: 'public-key', authenticatorAttachment: 'platform', clientExtensionResults: ext, response } };
+}
+
+// p: a decrypted passkey; o: PublicKeyCredentialRequestOptions as JSON.
+export async function passkeyGet(p, o, origin) {
+  const auth = await authData(p.rpId, UP_UV_BE_BS);
+  const cd = clientData('webauthn.get', o, origin);
+  const key = await subtle.importKey('pkcs8', unb64u(p.keyValue), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const sig = new Uint8Array(await subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, concat(auth, await sha256(cd))));
+  const id = b64u(credIdBytes(p.credentialId));
+  const response = toJSON({ clientDataJSON: cd, authenticatorData: auth, signature: der(sig), userHandle: p.userHandle ? unb64u(p.userHandle) : null });
+  return { id, rawId: id, type: 'public-key', authenticatorAttachment: 'platform', clientExtensionResults: {}, response };
+}
 
 // --- TOTP (RFC 6238) ------------------------------------------------------
 

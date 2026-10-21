@@ -6,6 +6,6 @@ set -eu
 cd "$(dirname "$0")"
 v=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' manifest.json)
 rm -rf dist && mkdir -p dist/bw-lite
-cp -R manifest.json popup.html popup.css popup.js theme.js bw.js icons vendor LICENSE dist/bw-lite/
+cp -R manifest.json popup.html popup.css popup.js theme.js bw.js background.js bridge.js page.js inpage.js autofill.js icons vendor LICENSE dist/bw-lite/
 (cd dist && zip -qrX "bw-lite-$v.zip" bw-lite)
 ls -l dist
