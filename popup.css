@@ -51,7 +51,9 @@ button.quiet:hover:not(:disabled) { background: none; color: var(--fg); text-dec
 .vault { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 170px; overflow: hidden; text-overflow: ellipsis; text-transform: none; letter-spacing: normal; }
 .vault i { flex: none; width: 7px; height: 7px; }
 .vault span { overflow: hidden; text-overflow: ellipsis; }
+.inline select { width: auto; max-width: 140px; }
 .info small .tag { padding: 0; }
 button.danger { margin-left: auto; color: var(--err); border-color: var(--err); }
 button.danger:hover:not(:disabled) { background: var(--err); border-color: var(--err); color: var(--bg); }
 .info .totp { padding: 0; }
+select { padding-right: 22px; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-position: right 12px center, right 8px center; background-size: 4px 4px; background-repeat: no-repeat; }

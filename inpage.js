@@ -59,15 +59,18 @@ if (!globalThis.bwliteFill) {
     root.addEventListener('mousedown', (e) => e.preventDefault()); // keep focus in the field so the click lands
     document.documentElement.append(menu);
   }
-  document.addEventListener('focusin', async (e) => {
-    const f = e.target;
+  async function maybeShow(f) {
     if (f === menuFor) return;
     closeMenu();
     const { user, pw } = loginFields(false);
     if ((f !== user && f !== pw) || f.autocomplete === 'new-password') return;
     const logins = await chrome.runtime.sendMessage({ bwliteMenu: true }).catch(() => null);
     if (logins?.length && document.activeElement === f && !menu) showMenu(f, logins);
-  }, true);
+  }
+  // click too: a field the page focused before this script ran (autofocus) gets no focusin when clicked
+  document.addEventListener('focusin', (e) => maybeShow(e.target), true);
+  document.addEventListener('click', (e) => e.isTrusted && e.target === document.activeElement && maybeShow(e.target), true);
+  if (document.activeElement instanceof HTMLInputElement) maybeShow(document.activeElement);
   document.addEventListener('focusout', (e) => e.target === menuFor && closeMenu(), true);
   document.addEventListener('keydown', (e) => e.key === 'Escape' && closeMenu(), true);
   addEventListener('scroll', closeMenu, true);
