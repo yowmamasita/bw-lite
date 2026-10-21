@@ -14,16 +14,18 @@ if (!globalThis.bwliteFill) {
 
   globalThis.bwliteFill = (username, password, code) => {
     const { user, pw } = loginFields(true);
+    let filled = false;
     const set = (el, v) => {
       el.focus();
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      filled = true;
     };
     if (user && username) set(user, username);
     if (pw && password) set(pw, password);
     if (code) navigator.clipboard.writeText(code).catch(() => {});
-    return !!((user && username) || pw);
+    return filled;
   };
 
   // --- menu under a login field: logins for this frame's site, from background.js. A closed shadow root keeps the
@@ -52,7 +54,7 @@ if (!globalThis.bwliteFill) {
       b.addEventListener('click', async (e) => {
         if (!e.isTrusted) return;
         closeMenu();
-        const c = await chrome.runtime.sendMessage({ bwliteFillKey: l.k });
+        const c = await chrome.runtime.sendMessage({ bwliteFillKey: l.k }).catch(() => null);
         if (c) bwliteFill(c.username, c.password, c.code);
       });
     }
@@ -90,17 +92,44 @@ if (!globalThis.bwliteFill) {
 
   // --- the save bar, top frame only
   let bar;
-  chrome.runtime.onMessage.addListener((m) => {
-    if (!m.bwliteBar || window !== top) return;
-    bar?.remove();
-    bar = document.createElement('iframe');
-    bar.src = chrome.runtime.getURL(`popup.html#save=${m.bwliteBar}`);
-    bar.style.cssText = 'all: initial; position: fixed; top: 12px; right: 12px; z-index: 2147483647; width: 382px; height: 110px; border: 1px solid #555; background: #000;';
+  const removeBar = () => { bar?.remove(); bar = null; };
+  const button = (root, text, onclick) => {
+    const b = document.createElement('button');
+    b.textContent = text;
+    b.addEventListener('click', onclick);
+    root.append(b);
+    return b;
+  };
+  const showSave = (key) => {
+    removeBar();
+    bar = document.createElement('bwlite-save');
+    bar.style.cssText = 'all: initial; position: fixed; top: 12px; right: 12px; z-index: 2147483647;';
+    const root = bar.attachShadow({ mode: 'closed' });
+    const style = document.createElement('style');
+    style.textContent = `
+      :host { all: initial; }
+      div { box-sizing: border-box; width: 382px; padding: 12px; background: #000; color: #fff;
+        border: 1px solid #555; font: 13px/1.4 system-ui, sans-serif; }
+      p { margin: 0 0 10px; } button { margin-right: 8px; padding: 5px 10px; cursor: pointer; }
+      @media (prefers-color-scheme: light) { div { background: #fff; color: #000; border-color: #bbb; } }`;
+    root.append(style);
+    const box = document.createElement('div');
+    const message = document.createElement('p');
+    message.textContent = 'BW Lite found a login to save.';
+    box.append(message);
+    const review = button(box, 'Review save', async (e) => {
+      if (!e.isTrusted) return;
+      review.disabled = true;
+      const result = await chrome.runtime.sendMessage({ bwliteSaveOpen: key }).catch(() => null);
+      if (result?.opened) removeBar();
+      else review.disabled = false;
+    });
+    button(box, '×', (e) => e.isTrusted && removeBar()).title = 'Dismiss';
+    root.append(box);
     document.documentElement.append(bar);
-  });
-  addEventListener('message', (e) => {
-    if (!bar || e.source !== bar.contentWindow) return;
-    if (e.data?.bwliteBar === 'close') bar = bar.remove();
-    else if (e.data?.bwliteBar === 'size') bar.style.height = `${Math.min(e.data.height + 2, 500)}px`;
+  };
+  chrome.runtime.onMessage.addListener((m) => {
+    if (typeof m?.bwliteBar !== 'string' || !/^[0-9a-f-]{20,100}$/.test(m.bwliteBar) || window !== top) return;
+    showSave(m.bwliteBar);
   });
 }

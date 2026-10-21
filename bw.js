@@ -1,4 +1,5 @@
 // Bitwarden protocol: key derivation, EncString crypto, API calls, TOTP. No chrome.* here so it runs in Node tests too.
+import { PUBLIC_SUFFIX_LIST } from './vendor/public_suffix_list.js';
 const subtle = crypto.subtle, te = new TextEncoder(), td = new TextDecoder();
 const CLIENT = { 'Device-Type': '2', 'Bitwarden-Client-Name': 'browser', 'Bitwarden-Client-Version': '2025.10.0' };
 
@@ -182,7 +183,7 @@ export async function decryptVault(sync, userKey, prev) {
       const passkeys = l.fido2Credentials?.length ? await Promise.all(l.fido2Credentials.map(async (f) =>
         Object.fromEntries(await Promise.all(PASSKEY_FIELDS.map(async (k) => [k, await decStr(f[k], key)]))))) : undefined;
       const m = l.uris?.some((u) => u.match != null) ? l.uris.map((u) => u.match) : undefined; // per-URI match type, when any is set
-      return { id: c.id, rev: c.revisionDate, raw: c, key, name, notes, username, password, totp, uris, d: uris.map(domainOf), m, passkeys };
+      return { id: c.id, rev: c.revisionDate, raw: c, key, name, notes, username, password, totp, uris, m, passkeys };
     } catch (e) {
       console.warn('Skipping undecryptable item', c.id, e);
     }
@@ -193,9 +194,13 @@ export async function decryptVault(sync, userKey, prev) {
 // item: a decryptVault() entry to edit, or null to create. Starts from the synced (still encrypted) cipher so
 // fields this client doesn't show (custom fields, passkeys, attachments, history) are sent back untouched.
 export async function saveCipher(s, userKey, item, v) {
+  if (item?.raw?.edit === false) throw new Error('This login is read-only');
+  if (item && (!item.raw || typeof item.raw !== 'object' || !item.id)) throw new Error('Login data is incomplete; sync and try again');
+  if (!v || !Array.isArray(v.uris)) throw new Error('Login URLs are invalid');
   const key = item?.key || userKey;
   const e = (x) => (x ? encrypt(x, key) : null);
   const c = item ? structuredClone(item.raw) : { type: 1, organizationId: null, folderId: null, favorite: false, reprompt: 0, login: {} };
+  c.login ||= {};
   const now = new Date().toISOString();
   if (item?.password && item.password !== v.password) {
     c.passwordHistory = [{ password: c.login.password, lastUsedDate: now }, ...(c.passwordHistory || [])].slice(0, 5);
@@ -215,7 +220,6 @@ export async function saveCipher(s, userKey, item, v) {
   delete c.login.uri; // legacy single-URI field; the server would append it to uris
   if (c.attachments) c.attachments2 = Object.fromEntries(c.attachments.map((a) => [a.id, { fileName: a.fileName, key: a.key }]));
   delete c.attachments;
-  delete c.data;
   c.encryptedFor = JSON.parse(atob(s.tokens.access.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).sub; // user id from the JWT
   if (!item) return api(s, '/ciphers', 'POST', c);
   c.lastKnownRevisionDate = c.revisionDate;
@@ -225,11 +229,56 @@ export async function saveCipher(s, userKey, item, v) {
 // Moves an item to the trash, as the official clients' Delete does (restorable there for 30 days).
 export const deleteCipher = (s, id) => api(s, `/ciphers/${id}/delete`, 'PUT');
 
-// ponytail: base domain without the public suffix list; covers co.uk-style suffixes only. Add a PSL if it mismatches.
+// The list includes ICANN and private suffixes (for example github.io and pages.dev).
+const psl = (() => {
+  const exact = new Set(), wildcard = new Set(), exception = new Set();
+  const idna = (rule) => {
+    const prefix = rule.startsWith('!') ? '!' : rule.startsWith('*.') ? '*.' : '';
+    const body = rule.slice(prefix === '!' ? 1 : prefix === '*.' ? 2 : 0);
+    try { return `${prefix}${new URL(`https://${body}`).hostname.toLowerCase().replace(/\.$/, '')}`; } catch { return rule.toLowerCase(); }
+  };
+  for (const raw of PUBLIC_SUFFIX_LIST.split(/\s+/)) {
+    if (!raw || raw.startsWith('//')) continue;
+    const rule = idna(raw);
+    if (rule[0] === '!') exception.add(rule.slice(1));
+    else if (rule.startsWith('*.')) wildcard.add(rule.slice(2));
+    else exact.add(rule);
+  }
+  return { exact, wildcard, exception };
+})();
+
+const normalizeHost = (host) => {
+  let value = String(host || '').trim();
+  try {
+    // URL.hostname applies IDNA (for example bücher.de -> xn--bcher-kva.de)
+    // consistently for both saved URIs and page origins.
+    if (value && !value.includes('/') && !value.startsWith('[')) value = new URL(`https://${value}`).hostname;
+  } catch {}
+  return value.toLowerCase().replace(/\.$/, '');
+};
+const ipHost = (host) => /^[\d.]+$/.test(host) || host.includes(':');
+const suffixLength = (host) => {
+  const labels = normalizeHost(host).split('.');
+  let best = 1;
+  for (let i = 0; i < labels.length; i++) {
+    const rule = labels.slice(i).join('.');
+    if (psl.exception.has(rule)) return labels.length - i - 1;
+    if (psl.exact.has(rule)) best = Math.max(best, labels.length - i);
+    if (i > 0 && psl.wildcard.has(labels.slice(i).join('.'))) best = Math.max(best, labels.length - i + 1);
+  }
+  return best;
+};
+
+export function isPublicSuffix(host) {
+  host = normalizeHost(host);
+  return !!host && !ipHost(host) && host.split('.').length === suffixLength(host);
+}
+
 export function baseDomain(host) {
-  if (/^[\d.]+$/.test(host) || host.includes(':')) return host;
-  const p = host.split('.');
-  return p.slice(/^(co|com|net|org|gov|ac|edu)$/.test(p.at(-2)) && p.at(-1).length === 2 ? -3 : -2).join('.');
+  host = normalizeHost(host);
+  if (!host || ipHost(host)) return host;
+  const p = host.split('.'), suffix = suffixLength(host);
+  return p.length <= suffix ? host : p.slice(-(suffix + 1)).join('.');
 }
 
 const toURL = (u) => new URL(/^[a-z][\w+.-]*:\/\//i.test(u) ? u : `https://${u}`);
@@ -244,19 +293,46 @@ export function domainOf(u) {
 
 // groups: lists of domains the server treats as one site (sync.domains). Returns domain -> every domain it equals.
 export function equivalents(groups) {
-  const m = new Map();
-  for (const g of groups) for (const d of g) m.set(d, new Set([...(m.get(d) || []), ...g]));
-  return m;
+  const parent = new Map();
+  const find = (x) => {
+    if (!parent.has(x)) parent.set(x, x);
+    while (parent.get(x) !== x) {
+      parent.set(x, parent.get(parent.get(x)));
+      x = parent.get(x);
+    }
+    return x;
+  };
+  const union = (a, b) => {
+    a = find(a); b = find(b);
+    if (a !== b) parent.set(b, a);
+  };
+  for (const group of groups || []) {
+    if (!Array.isArray(group)) continue;
+    const domains = group.map(domainOf).filter(Boolean);
+    for (const d of domains) find(d);
+    for (const d of domains.slice(1)) union(domains[0], d);
+  }
+  const components = new Map();
+  for (const d of parent.keys()) {
+    const root = find(d), set = components.get(root) || new Set();
+    set.add(d); components.set(root, set);
+  }
+  const out = new Map();
+  for (const set of components.values()) for (const d of set) out.set(d, set);
+  return out;
 }
 
 // Per saved URI, its match type as in Bitwarden: null/0 base domain (or an equivalent one), 1 host (with port),
-// 2 starts with, 3 exact, 4 regular expression, 5 never. item.d: domains precomputed by decryptVault.
+// 2 starts with, 3 exact, 4 regular expression, 5 never.
 export function matches(item, url, equiv) {
-  const page = new URL(url), site = baseDomain(page.hostname);
+  if (!item || !Array.isArray(item.uris)) return false;
+  let page;
+  try { page = new URL(url); } catch { return false; }
+  const site = baseDomain(page.hostname);
   return item.uris.some((u, n) => {
     try {
       switch (item.m?.[n] ?? 0) {
-        case 0: { const d = item.d ? item.d[n] : domainOf(u); return d === site || !!equiv?.get(site)?.has(d); }
+        case 0: { const d = domainOf(u); return !!d && (d === site || !!equiv?.get(site)?.has(d)); }
         case 1: return toURL(u).host === page.host;
         case 2: return url.startsWith(u);
         case 3: return url === u;
@@ -270,7 +346,7 @@ export function matches(item, url, equiv) {
 }
 
 // The logins for a page, best first: last used (used: {'account:cipher': time}), then vault order (rank).
-export const forSite = (items, url, equiv, rank, used = {}) => items.filter((i) => matches(i, url, equiv))
+export const forSite = (items, url, equiv, rank, used = {}) => (Array.isArray(items) ? items : []).filter((i) => matches(i, url, typeof equiv === 'function' ? equiv(i) : equiv))
   .sort((x, y) => (used[`${y.a}:${y.id}`] || 0) - (used[`${x.a}:${x.id}`] || 0) || rank(x.a) - rank(y.a));
 
 // --- passkeys (WebAuthn, ES256 only) --------------------------------------
@@ -350,17 +426,24 @@ function base32(s) {
 }
 
 export async function totp(secret, now = Date.now()) {
+  if (typeof secret !== 'string' || !secret.trim()) throw new Error('Bad TOTP secret');
   let algo = 'SHA-1', digits = 6, period = 30;
   if (/^otpauth:/i.test(secret)) {
     const q = new URL(secret).searchParams;
     secret = q.get('secret') || '';
-    algo = { SHA256: 'SHA-256', SHA512: 'SHA-512' }[q.get('algorithm')?.toUpperCase()] || 'SHA-1';
-    digits = +q.get('digits') || 6;
-    period = +q.get('period') || 30;
+    const algorithm = q.get('algorithm')?.toUpperCase() || 'SHA1';
+    algo = { SHA1: 'SHA-1', 'SHA-1': 'SHA-1', SHA256: 'SHA-256', 'SHA-256': 'SHA-256', SHA512: 'SHA-512', 'SHA-512': 'SHA-512' }[algorithm];
+    if (!algo) throw new Error('Unsupported TOTP algorithm');
+    digits = q.has('digits') ? Number(q.get('digits')) : 6;
+    period = q.has('period') ? Number(q.get('period')) : 30;
   }
+  if (![6, 8].includes(digits)) throw new Error('Unsupported TOTP digits');
+  if (!Number.isSafeInteger(period) || period <= 0 || period > 86400) throw new Error('Bad TOTP period');
+  const key = base32(secret);
+  if (!key.length) throw new Error('Bad TOTP secret');
   const counter = new Uint8Array(8);
   for (let t = Math.floor(now / 1000 / period), i = 7; i >= 0; i--, t = Math.floor(t / 256)) counter[i] = t & 0xff;
-  const h = await hmac(base32(secret), counter, algo);
+  const h = await hmac(key, counter, algo);
   const o = h[h.length - 1] & 0xf;
   const n = (((h[o] & 0x7f) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3]) % 10 ** digits;
   return { code: String(n).padStart(digits, '0'), remaining: period - (Math.floor(now / 1000) % period) };
