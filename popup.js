@@ -198,6 +198,7 @@ async function start() {
   await loadEquiv();
   vaultView();
   if (problems) status(problems);
+  if (!mode) refreshStale();
 }
 
 // 0.1/0.2 stored one account in flat keys. Move it into the accounts list; its cached vault is re-synced.
@@ -299,7 +300,7 @@ const loadEquiv = async () => {
 const failures = (todo, res) =>
   res.map((r, i) => r.status === 'rejected' && `${todo[i].label}: ${r.reason?.message || String(r.reason)}`).filter(Boolean).join('\n');
 
-// Manual (Sync button / Ctrl+S), except for an account with no local data yet. Unchanged items aren't decrypted again.
+// Sync button / Ctrl+S, refreshStale() on open, and an account with no local data yet. Unchanged items aren't decrypted again.
 const syncAccount = (a) => accountTask(a, () => syncAccountNow(a));
 async function syncAccountNow(a) {
   const p = `${a.id}:`;
@@ -320,6 +321,23 @@ async function syncAccountNow(a) {
   await setList(a, items);
   await patchAccountsUnlocked(a.id, { lastSync: Date.now() });
   await loadEquiv();
+}
+
+// Opening or unlocking the popup syncs vaults last synced over 5 minutes ago, in the background, so a change made in another
+// client (a new TOTP secret, a changed password) shows up without pressing sync.
+async function refreshStale() {
+  const stale = unlocked().filter((a) => Date.now() - (a.lastSync || 0) > 5 * 60e3);
+  if (!stale.length) return;
+  const res = await Promise.allSettled(stale.map(syncAccount));
+  merge();
+  const q = document.getElementById('search');
+  if (!q) return; // an edit form or another view is open; it picks up the new data when it returns to the list
+  const focused = document.activeElement === q, at = q.selectionStart;
+  vaultView();
+  const fresh = document.getElementById('search');
+  if (focused) (fresh.focus(), fresh.setSelectionRange?.(at, at));
+  const problems = failures(stale, res);
+  if (problems) status(problems);
 }
 
 async function syncAll() {
@@ -390,6 +408,7 @@ function unlockView() {
         const problems = await loadVaults();
         vaultView();
         if (problems) status(problems);
+        refreshStale();
       });
     },
   },
@@ -611,7 +630,7 @@ function vaultView() {
   const multi = accounts.length > 1;
   let top, here = []; // top: the login autofill uses (first of the site's logins); Enter fills it
   const q = h('input', {
-    type: 'search', placeholder: 'Search all logins', value: query,
+    id: 'search', type: 'search', placeholder: 'Search all logins', value: query,
     oninput: () => ((query = q.value), draw()),
     onkeydown: (e) => e.key === 'Enter' && top && fill(top),
   });

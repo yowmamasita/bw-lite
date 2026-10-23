@@ -477,6 +477,29 @@ assert.equal(passkeyCalls, 1, 'Use invokes passkey signing');
 assert.equal(passkeyPopup.sent.at(-1)[1].bwliteRes, 'use-request', 'passkey Use answers the originating request');
 assert.deepEqual(passkeyPopup.sent.at(-1)[1].result, { id: 'credential-result' });
 
+// Opening the popup syncs a vault last synced over 5 minutes ago in the background; a recent one is left alone.
+const textOf = (node) => `${node?.textContent || ''} ${(node?.children || []).map(textOf).join(' ')}`;
+const findById = (node, id) => node?.id === id ? node : (node?.children || []).reduce((f, c) => f || findById(c, id), null);
+for (const [lastSync, expectSync] of [[Date.now() - 6 * 60e3, true], [Date.now() - 60e3, false]]) {
+  let syncCalls = 0;
+  const fresh = [{ id: 'fresh-item', name: 'Login', username: 'fresh-user', password: 'p', uris: ['https://example.com'] }];
+  const popup = makePopup('', {
+    local: { accounts: [{ ...popupAccount('acct', 'Vault'), lastSync }] },
+    session: { 'acct:key': popupKey, 'acct:list': JSON.stringify(popupList('acct')) },
+  }, { bw: { api: async (_, path) => (path === '/sync' && syncCalls++, { ciphers: [], profile: {}, domains: {} }), decryptVault: async () => fresh } });
+  await popup.api.start();
+  const search = findById(popup.app, 'search');
+  search.value = 'fresh'; search.listeners.input(); // typing while the sync runs
+  popup.context.document.activeElement = search;
+  for (let i = 0; i < 20 && !textOf(popup.app).includes('fresh-user'); i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(syncCalls, expectSync ? 1 : 0, expectSync ? 'a stale vault syncs when the popup opens' : 'a recent vault does not sync on open');
+  assert.equal(textOf(popup.app).includes('fresh-user'), expectSync, 'the list shows what the background sync brought');
+  if (expectSync) {
+    const redrawn = findById(popup.app, 'search');
+    assert.ok(redrawn !== search && redrawn.focused && redrawn.value === 'fresh', 'the redraw keeps the search text and focus');
+  }
+}
+
 const staleAccount = popupAccount('stale');
 const adoptPopup = makePopup('', { local: { accounts: [staleAccount] } });
 adoptPopup.api.adoptAccounts([{ ...staleAccount, persistKey: popupKey }]);
