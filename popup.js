@@ -588,8 +588,8 @@ async function fill(item) {
   const ok = await fillTab(tab.id, item, equiv.get(item.a), code, guard, tab.documentId).catch((e) => status(e.message));
   if (!ok) return ok === false && status('No login form for this login on the page');
   if (!await guard()) return status('Vault locked before filling finished');
+  await markUsed(item); // before the clipboard, which can throw and leave the fill unrecorded
   if (code) await navigator.clipboard.writeText(code);
-  await markUsed(item);
   window.close();
 }
 
@@ -787,6 +787,14 @@ async function answer(res) {
   window.close();
 }
 
+// Chrome sizes the window before the page renders; shrink or grow it to what the passkey view shows.
+async function fitWindow() {
+  try {
+    const w = await chrome.windows.getCurrent();
+    await chrome.windows.update(w.id, { height: Math.min(outerHeight - innerHeight + document.body.offsetHeight, 620) });
+  } catch {}
+}
+
 // ponytail: user verification is the unlocked vault plus this click; there is no extra master password prompt.
 function passkeyView() {
   const { kind, rpId, origin, options: o } = pk;
@@ -811,7 +819,7 @@ function passkeyView() {
     h('button', { type: 'button', onclick: () => answer({ fallback: true }) }, 'Use device or security key'),
     h('button', { type: 'button', onclick: () => answer(CANCEL) }, 'Cancel'));
   const show = (heading, text, rows, extra = '') =>
-    app.replaceChildren(title(heading), h('p', { className: 'muted' }, text), h('div', { className: 'list' }, rows), extra, others, err);
+    (app.replaceChildren(title(heading), h('p', { className: 'muted' }, text), h('div', { className: 'list' }, rows), extra, others, err), fitWindow());
 
   if (kind === 'get') {
     const allow = ids(o.allowCredentials);

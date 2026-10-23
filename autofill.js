@@ -19,7 +19,7 @@ export async function fillTab(tabId, item, equiv, code = null, guard = async () 
       target: frameDocumentId ? { tabId, documentIds: [frameDocumentId] } : { tabId, frameIds: [frameId] },
       args: [href, item.username, item.password, code],
       func: (expected, u, p, c) => location.href === expected && bwliteFill(u, p, c), // the frame may have navigated meanwhile
-    });
+    }).catch(() => []); // a frame that went away must not hide the fill that worked in another
   }));
   return res.some(([r]) => r?.result);
 }
