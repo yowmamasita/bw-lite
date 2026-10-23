@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "BW Lite",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Minimal unofficial Bitwarden/Vaultwarden client: search, copy, autofill, TOTP, passkeys, save prompts, add and edit logins.",
   "homepage_url": "https://github.com/yowmamasita/bw-lite",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp0GywNNCIZoYfioyrV51xUuxMfPZU23/diSfHxfa9O/oYSxm8N4iTxC8Eui/ucyGdXS+X7jEm1TFL0eujbNJr8lerKlC6XNzpyPbvSVUxMjEDVP0yZx6bkYdxd9tvp6gRS/e2LqwFYMWpWyD9IDBng8oNDW/XkusIDTnbwjTAD36wpKMl01bm0pzw5l5WTsmeGqrOiW/4baD6wyHswULec5gP6MMTJGZCge0/EwhuLeQ91m78MLHkdRGtcW4tueDvoV5941Z00AsLy80mVz+vlrmhP0CShDcaGCzGGipX9eTsTM09YEsv2nZfFAIYbJLpXgJkQg/pKT89WVBZQea1QIDAQAB",
-  "minimum_chrome_version": "111",
+  "minimum_chrome_version": "121",
   "icons": {
     "16": "icons/16.png",
     "48": "icons/48.png",
@@ -20,6 +20,9 @@
   },
   "background": {
     "service_worker": "background.js",
+    "scripts": [
+      "background.js"
+    ],
     "type": "module"
   },
   "content_scripts": [
@@ -73,6 +76,17 @@
         "mac": "Command+Shift+L"
       },
       "description": "Fill the top login for this site"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "bw-lite@bensarmiento.com",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "authenticationInfo"
+        ]
+      }
     }
   }
 }
