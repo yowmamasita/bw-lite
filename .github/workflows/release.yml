@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag like v0.3.2 that matches manifest.json; the tested build is published as a GitHub release.
+# Push an annotated tag like v0.3.2 that matches manifest.json; its message becomes the release notes and the
+# tested build is published as a GitHub release.
 on:
   push:
     tags: ['v*']
@@ -31,4 +32,6 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --title "BW Lite ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag
+        run: |
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME" # checkout drops the tag's annotation
+          gh release create "$GITHUB_REF_NAME" dist/*.zip --title "BW Lite ${GITHUB_REF_NAME#v}" --notes-from-tag --verify-tag
