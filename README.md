@@ -1,6 +1,6 @@
 # BW Lite
 
-A tiny Chrome extension for Bitwarden and Vaultwarden. Around 1,900 lines of plain JavaScript, no build step and no framework.
+A tiny Chrome extension for Bitwarden and Vaultwarden. Around 2,000 lines of plain JavaScript, no build step and no framework.
 
 <p>
   <img src="screenshots/popup.png" width="300" alt="Popup with logins for github.com from two vaults">

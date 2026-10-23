@@ -13,7 +13,7 @@ const options = (kind, source) => {
   for (const key of fields) if (Object.prototype.hasOwnProperty.call(source, key)) out[key] = source[key];
   // This cheap check lets malformed requests fall back immediately. The
   // background validator checks all nested descriptors and protocol rules.
-  return typeof out.challenge === 'string' && out.challenge.length > 0 && out.challenge.length <= 1000 ? out : null;
+  return typeof out.challenge === 'string' && out.challenge.length > 0 && out.challenge.length <= 16384 ? out : null;
 };
 const response = (m, id) => {
   if (!m || m.bwliteRes !== id) return null;

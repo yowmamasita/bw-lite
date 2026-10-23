@@ -283,6 +283,17 @@ await sendRuntime({ bwliteReq: 'rp-2', kind: 'create', options: {
   challenge: 'c', rp: { id: 'login.github.io', name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }],
 } }, { origin: 'https://login.github.io', tab: { id: 1 }, url: 'https://login.github.io/' });
 assert.ok(createdWindows.length, 'a registrable private suffix may be an RP ID');
+const windowsBefore = createdWindows.length;
+await sendRuntime({ bwliteReq: 'rp-real', kind: 'create', options: {
+  challenge: 'c'.repeat(1670), timeout: 60000, rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }],
+  authenticatorSelection: { residentKey: 'required', userVerification: 'required' }, extensions: { appid: 'x' },
+} }, { origin: 'https://login.github.io', tab: { id: 1 }, url: 'https://login.github.io/' });
+assert.equal(createdWindows.length, windowsBefore + 1, 'everyday options (timeout, UV, residentKey, extensions) open BW Lite');
+const securityKey = await sendRuntime({ bwliteReq: 'rp-key', kind: 'create', options: {
+  challenge: 'c', rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }],
+  authenticatorSelection: { authenticatorAttachment: 'cross-platform' },
+} }, { origin: 'https://login.github.io', tab: { id: 1 }, url: 'https://login.github.io/' });
+assert.equal(securityKey.fallback, true, 'a request for a security key goes to the browser');
 await sendRuntime({ bwliteReq: 'rp-3', kind: 'create', options: {
   challenge: 'c', rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }],
 } }, { origin: 'https://localhost', tab: { id: 1 }, url: 'https://localhost/' });
@@ -513,6 +524,25 @@ await framedSave.api.start();
 assert.equal(framedSave.closed, true, 'a web frame cannot render the save confirmation');
 assert.equal(framedSave.parentMessages.length, 0);
 console.log('popup storage, passkey, account, save-window, and move checks ok');
+// page.js: the credential it hands the page takes the toJSON that @github/webauthn-json assigns (in strict mode).
+{
+  const listeners = [];
+  const ctx = {
+    btoa, atob, crypto, setTimeout, clearTimeout, DOMException,
+    PublicKeyCredential: class {}, AuthenticatorAssertionResponse: class {}, AuthenticatorAttestationResponse: class {},
+    navigator: { credentials: { create: async () => null, get: async () => null } },
+    addEventListener: (_, f) => listeners.push(f), removeEventListener: () => {},
+    postMessage: (m) => queueMicrotask(() => listeners.forEach((f) => f({ source: vm.runInContext('window', ctx), data: { bwliteRes: m.bwliteReq, result: {
+      id: 'aWQ', rawId: 'aWQ', type: 'public-key', clientExtensionResults: {},
+      response: { clientDataJSON: 'e30', authenticatorData: 'AA', signature: 'AA', userHandle: null } } } }))),
+  };
+  ctx.window = ctx;
+  vm.runInNewContext(await readFile('./page.js', 'utf8'), ctx);
+  const cred = await ctx.navigator.credentials.get({ publicKey: { challenge: new Uint8Array([1]) } });
+  assert.doesNotThrow(() => { 'use strict'; cred.toJSON = () => 'mine'; }, 'credential.toJSON is assignable');
+  assert.equal(cred.toJSON(), 'mine');
+  console.log('page credential checks ok');
+}
 const inpageSource = await readFile('./inpage.js', 'utf8');
 assert.equal(inpageSource.includes('popup.html#save='), false, 'the page bar cannot frame the extension popup');
 assert.equal(inpageSource.includes('attachShadow({ mode: \'closed\' })'), true, 'the save token stays in a closed extension bar');

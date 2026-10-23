@@ -10,7 +10,8 @@
   const toJSON = (v) => (v instanceof ArrayBuffer || ArrayBuffer.isView(v) ? b64u(v)
     : Array.isArray(v) ? v.map(toJSON)
     : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, toJSON(x)])) : v);
-  const props = (o) => Object.fromEntries(Object.entries(o).map(([k, value]) => [k, { value, enumerable: true }]));
+  // writable: @github/webauthn-json assigns its own credential.toJSON, which throws on a read-only property
+  const props = (o) => Object.fromEntries(Object.entries(o).map(([k, value]) => [k, { value, enumerable: true, writable: true, configurable: true }]));
 
   // Objects with the real prototypes, so `instanceof PublicKeyCredential` holds; own values shadow the native getters.
   function credential(j) {

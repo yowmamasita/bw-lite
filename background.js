@@ -217,17 +217,14 @@ const validDescriptor = (d) => d && typeof d === 'object' && typeof d.id === 'st
   && (d.type === undefined || d.type === 'public-key')
   && (d.transports === undefined || Array.isArray(d.transports) && d.transports.every((t) => ['usb', 'nfc', 'ble', 'internal', 'hybrid', 'smart-card'].includes(t)));
 const supportedPasskeyOptions = (kind, o) => {
-  // The local implementation always creates a platform discoverable key and
-  // cannot satisfy arbitrary authenticator/extension requirements. Let the
-  // browser handle requests whose semantics we cannot reproduce.
-  if (o.timeout !== undefined || o.authenticatorSelection || o.authenticatorAttachment || o.userVerification
-    || o.attestation && o.attestation !== 'none') return false;
-  if (o.extensions && (typeof o.extensions !== 'object' || Object.keys(o.extensions).some((k) => k !== 'credProps'))) return false;
-  if (kind === 'create' && (o.rp?.icon !== undefined || o.user?.icon !== undefined)) return false;
+  // Every passkey here is a user-verified platform discoverable key, so timeout, userVerification and residentKey
+  // are always satisfiable and unknown extensions are ignored, as WebAuthn allows. Only a request that insists on a
+  // security key or enterprise attestation goes to the browser.
+  if (o.authenticatorSelection?.authenticatorAttachment === 'cross-platform' || o.attestation === 'enterprise') return false;
   return kind === 'get' || kind === 'create';
 };
 const validPasskeyOptions = (kind, o) => {
-  if (!o || typeof o !== 'object' || typeof o.challenge !== 'string' || !o.challenge.length || o.challenge.length > 1000) return false;
+  if (!o || typeof o !== 'object' || typeof o.challenge !== 'string' || !o.challenge.length || o.challenge.length > 16384) return false; // Google sends ~1.7k chars
   if (!supportedPasskeyOptions(kind, o)) return false;
   if (kind === 'create') return o.rp && typeof o.rp === 'object' && typeof o.rp.name === 'string' && o.rp.name.length < 1000
     && (o.rp.id === undefined || (typeof o.rp.id === 'string' && o.rp.id.length > 0))
@@ -308,7 +305,7 @@ async function passkey({ bwliteReq, kind, options: o }, { origin, tab, documentI
   await session.set({ [`pk:${key}`]: { id: bwliteReq, kind, options: o, origin, rpId, tabId: tab.id, documentId } });
   if (version !== stateVersion) return session.remove(`pk:${key}`).then(() => fallback);
   try {
-    await chrome.windows.create({ url: `popup.html#pk=${key}`, type: 'popup', width: 410, height: 620 });
+    await chrome.windows.create({ url: `popup.html#pk=${key}`, type: 'popup', width: 410, height: 320 });
   } catch (e) {
     await session.remove(`pk:${key}`);
     throw e;
