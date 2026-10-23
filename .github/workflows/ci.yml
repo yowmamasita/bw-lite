@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      vaultwarden:
+        image: vaultwarden/server:1.37.4
+        ports: ['8099:80']
+        env:
+          I_REALLY_WANT_VOLATILE_STORAGE: 'true'
+          LOGIN_RATELIMIT_MAX_BURST: '100'
+          LOGIN_RATELIMIT_SECONDS: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Wait for Vaultwarden
+        run: timeout 60 sh -c 'until curl -sf localhost:8099/alive; do sleep 1; done'
+      - name: Offline and integration tests
+        run: node test.mjs --integration
+      - name: Build
+        run: ./pack.sh
+      - name: Lint for Firefox
+        run: npx --yes web-ext@10.8.0 lint --source-dir dist/bw-lite
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*.zip

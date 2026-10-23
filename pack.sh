@@ -8,6 +8,7 @@ cd "$(dirname "$0")"
 v=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' manifest.json)
 rm -rf dist && mkdir -p dist/bw-lite
 cp -R manifest.json popup.html popup.css popup.js theme.js bw.js background.js bridge.js page.js inpage.js autofill.js coord.js icons vendor LICENSE dist/bw-lite/
+rm dist/bw-lite/vendor/psl.sh # build tool for public_suffix_list.js, not part of the extension
 (cd dist && zip -qrX "bw-lite-$v.zip" bw-lite)
 cp -R dist/bw-lite dist/store && grep -v '"key":' manifest.json > dist/store/manifest.json
 (cd dist/store && zip -qrX "../bw-lite-$v-store.zip" .) && rm -rf dist/store
