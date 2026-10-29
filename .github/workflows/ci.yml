@@ -37,7 +37,7 @@ jobs:
       - name: Build
         run: ./pack.sh
       - name: Lint for Firefox
-        run: npx --yes web-ext@10.8.0 lint --source-dir dist/bw-lite
+        run: npx --yes web-ext@10.8.0 lint --source-dir dist/firefox
       - uses: actions/upload-artifact@v7
         with:
           name: dist

@@ -47,6 +47,9 @@ addEventListener('message', (e) => {
   if (!idOf(id)) return;
   const o = options(kind, e.data.options);
   if (!o) return send({ bwliteRes: id, fallback: true }, id);
-  chrome.runtime.sendMessage({ bwliteReq: id, kind, options: o }).then((r) => r && send(r, id), () => send({ bwliteRes: id, fallback: true }, id));
+  const fallback = () => send({ bwliteRes: id, fallback: true }, id);
+  try {
+    chrome.runtime.sendMessage({ bwliteReq: id, kind, options: o }).then((r) => r && send(r, id), fallback);
+  } catch { fallback(); } // "Extension context invalidated": BW Lite was reloaded or updated under this page
 });
 chrome.runtime.onMessage.addListener((m) => m?.bwliteRes && send(m, m.bwliteRes));

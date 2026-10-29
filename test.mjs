@@ -211,6 +211,9 @@ await bridgeListeners.message({ source: bridgeWindow, data: {
   bwliteReq: 'bridge-4', kind: 'create', options: { challenge: 'c', authenticatorSelection: { authenticatorAttachment: 'cross-platform' }, evil: 'discard' },
 } });
 assert.deepEqual(bridgeRuntime.at(-1).options.authenticatorSelection, { authenticatorAttachment: 'cross-platform' }, 'unsupported requirements reach the authoritative validator');
+bridgeContext.chrome.runtime.sendMessage = () => { throw new Error('Extension context invalidated.'); }; // extension reloaded under the page
+await bridgeListeners.message({ source: bridgeWindow, data: { bwliteReq: 'bridge-5', kind: 'get', options: { challenge: 'c' } } });
+assert.equal(JSON.stringify(bridgePosts.at(-1).m), JSON.stringify({ bwliteRes: 'bridge-5', fallback: true }), 'a dead extension context hands the request to the browser');
 console.log('bridge boundary checks ok');
 
 // Minimal Chrome storage/runtime harness for service-worker regressions; no browser or Docker is needed.

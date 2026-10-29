@@ -1,7 +1,9 @@
 name: Release
 
 # Push an annotated tag like v0.3.2 that matches manifest.json; its message becomes the release notes and the
-# tested build is published as a GitHub release.
+# tested build is published as a GitHub release, then submitted to Firefox Add-ons and the Chrome Web Store when the
+# store secrets exist (AMO_JWT_ISSUER/AMO_JWT_SECRET from addons.mozilla.org/developers/addon/api/key/;
+# CWS_CLIENT_ID/CWS_CLIENT_SECRET/CWS_REFRESH_TOKEN per github.com/fregante/chrome-webstore-upload-keys).
 on:
   push:
     tags: ['v*']
@@ -16,11 +18,22 @@ jobs:
   release:
     needs: ci
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     permissions:
       contents: write
+    env:
+      AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+      AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+      CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+      EXTENSION_ID: dfjjkaikjkemjhjnpmbimmlbbccngmjb
+      PUBLISHER_ID: 4153827d-03c2-44a6-9aeb-e9a0d211e2d1
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Tag matches manifest version
         run: test "${GITHUB_REF_NAME#v}" = "$(node -p 'require("./manifest.json").version')"
       - uses: actions/download-artifact@v8
@@ -35,3 +48,18 @@ jobs:
         run: |
           git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME" # checkout drops the tag's annotation
           gh release create "$GITHUB_REF_NAME" dist/*.zip --title "BW Lite ${GITHUB_REF_NAME#v}" --notes-from-tag --verify-tag
+      - name: Submit to Firefox Add-ons
+        if: env.AMO_JWT_SECRET != ''
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          mkdir -p dist/firefox && unzip -qo "dist/bw-lite-$v-firefox.zip" -d dist/firefox
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" | node -e '
+            const fs = require("fs"), notes = fs.readFileSync(0, "utf8").split("\n").slice(1).join("\n").trim(); // first line is the title
+            const approval_notes = "No build step: the source archive is the repository at this tag. vendor/argon2.umd.min.js is dist/argon2.umd.min.js from the hash-wasm 4.12.0 npm package, unmodified; vendor/public_suffix_list.js is generated from the included vendor/public_suffix_list.dat by vendor/psl.sh. Tests: node test.mjs.";
+            fs.writeFileSync("amo.json", JSON.stringify({ version: { release_notes: { "en-US": notes }, approval_notes } }));'
+          npx --yes web-ext@10.8.0 sign --channel listed --source-dir dist/firefox --artifacts-dir dist/signed \
+            --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET" --upload-source-code "dist/bw-lite-$v-source.zip" \
+            --amo-metadata amo.json --approval-timeout 0
+      - name: Submit to the Chrome Web Store
+        if: env.REFRESH_TOKEN != ''
+        run: npx --yes chrome-webstore-upload-cli@4.0.2 --source "dist/bw-lite-${GITHUB_REF_NAME#v}-chrome.zip" # no sub-command: upload, then publish
