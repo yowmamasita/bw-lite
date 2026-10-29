@@ -61,6 +61,12 @@ assert.ok(bw.matches(item(['https://BÜCHER.DE']), 'https://xn--bcher-kva.de/'))
 assert.ok(bw.isPublicSuffix('公司.cn'), 'Unicode PSL rules are normalized to IDNA');
 assert.equal(bw.baseDomain('alice.公司.cn'), 'alice.xn--55qx5d.cn');
 assert.ok(!bw.matches(item(['https://alice.公司.cn']), 'https://bob.公司.cn/'));
+const ror = { origins: ['https://facebook.com', 'https://www.facebook.com', 'not a url', 'https://github.io', 'https://a.messenger.com', 'https://instagram.com', 'https://meta.com', 'https://muse.ai', 'https://sixth.example', 'https://www.instagram.com'] };
+assert.ok(bw.relatedOrigin(ror, 'https://www.facebook.com'));
+assert.ok(bw.relatedOrigin(ror, 'https://www.instagram.com'), 'a label already seen still counts after the limit');
+assert.ok(!bw.relatedOrigin(ror, 'https://sixth.example'), 'only 5 distinct labels count');
+assert.ok(!bw.relatedOrigin(ror, 'https://m.facebook.com'));
+assert.ok(!bw.relatedOrigin({}, 'https://www.facebook.com'));
 assert.ok(!bw.matches({ uris: ['https://old.invalid'], d: ['example.com'] }, 'https://example.com/', null));
 // per-URI match types: 1 host, 2 starts with, 3 exact, 4 regex, 5 never
 assert.ok(bw.matches(item(['https://a.example.com'], [1]), 'https://a.example.com/x'));
@@ -93,6 +99,15 @@ const perVaultEq = new Map([
 ]);
 const grouped = [{ a: 'v1', id: 'one', uris: ['https://one.example'] }, { a: 'v2', id: 'two', uris: ['https://two.example'] }];
 assert.deepEqual(bw.forSite(grouped, 'https://shared.example/', (i) => perVaultEq.get(i.a), rank).map((i) => i.id), ['one']);
+{ // an edited URL keeps the match type of the URL in its place
+  const k = crypto.getRandomValues(new Uint8Array(64)), realFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_, o) => ((body = JSON.parse(o.body)), { ok: true, text: async () => '{}' });
+  const s = { server: 'https://vault.example', tokens: { access: `x.${btoa('{"sub":"u"}')}.y`, expires: Infinity } };
+  const old = { id: 'c', key: k, uris: ['https://old.example'], raw: { id: 'c', login: { uris: [{ uri: '2.x', match: 3 }] } } };
+  await bw.saveCipher(s, k, old, { name: 'n', uris: ['https://new.example'] }).finally(() => (globalThis.fetch = realFetch));
+  assert.equal(body.login.uris[0].match, 3);
+}
 
 // Two popup-like contexts must merge account patches while one is suspended;
 // the second writer must never replace the first writer's latest list.
@@ -118,19 +133,21 @@ if (oldLocks) Object.defineProperty(globalThis.navigator, 'locks', { configurabl
 else delete globalThis.navigator.locks;
 const oldChrome = globalThis.chrome;
 let fillCalls = 0;
+const fillTargets = [];
 globalThis.chrome = { scripting: { executeScript: async ({ target, files, func }) => {
   fillCalls++;
-  assert.ok(target.documentIds?.[0] === 'doc-1' || target.frameIds?.[0] === 0 || target.allFrames);
+  fillTargets.push(target);
   if (files) return [];
-  if (target.allFrames || target.documentIds) return [{ frameId: 0, result: 'https://example.com/login' }];
+  if (target.allFrames) return [{ frameId: 0, result: 'https://example.com/login' }];
   return [{ result: true }];
 } } };
 let authorized = false;
-assert.equal(await fillTab(1, { uris: ['https://example.com'] }, null, null, async () => authorized, 'doc-1'), false);
+assert.equal(await fillTab(1, { uris: ['https://example.com'] }, null, null, async () => authorized), false);
 assert.equal(fillCalls, 0, 'fill does not inject before the authorization guard');
 authorized = true;
-assert.equal(await fillTab(1, { uris: ['https://example.com'] }, null, null, async () => authorized, 'doc-1'), true);
-assert.equal(fillCalls, 3, 'fill checks the guard and targets the current document');
+assert.equal(await fillTab(1, { uris: ['https://example.com'] }, null, null, async () => authorized), true);
+assert.deepEqual(fillTargets, [{ tabId: 1, allFrames: true }, { tabId: 1, allFrames: true }, { tabId: 1, frameIds: [0] }],
+  'fill checks every frame and fills only the matching one');
 if (oldChrome) globalThis.chrome = oldChrome;
 else delete globalThis.chrome;
 console.log('offline checks ok');
@@ -287,7 +304,7 @@ const windowsBefore = createdWindows.length;
 await sendRuntime({ bwliteReq: 'rp-real', kind: 'create', options: {
   challenge: 'c'.repeat(1670), timeout: 60000, rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }],
   authenticatorSelection: { residentKey: 'required', userVerification: 'required' }, extensions: { appid: 'x' },
-} }, { origin: 'https://login.github.io', tab: { id: 1 }, url: 'https://login.github.io/' });
+} }, { origin: 'https://login.github.io', tab: { id: 2 }, url: 'https://login.github.io/' }); // tab 1 has rp-2 pending
 assert.equal(createdWindows.length, windowsBefore + 1, 'everyday options (timeout, UV, residentKey, extensions) open BW Lite');
 const securityKey = await sendRuntime({ bwliteReq: 'rp-key', kind: 'create', options: {
   challenge: 'c', rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }],
@@ -296,7 +313,19 @@ const securityKey = await sendRuntime({ bwliteReq: 'rp-key', kind: 'create', opt
 assert.equal(securityKey.fallback, true, 'a request for a security key goes to the browser');
 await sendRuntime({ bwliteReq: 'rp-3', kind: 'create', options: {
   challenge: 'c', rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }],
-} }, { origin: 'https://localhost', tab: { id: 1 }, url: 'https://localhost/' });
+} }, { origin: 'https://localhost', tab: { id: 3 }, url: 'https://localhost/' });
+// One pending request per tab (tab 1 still has rp-2); WebAuthn L3 tolerates unknown transports and empty pubKeyCredParams.
+const create = (extra = {}) => ({ challenge: 'c', rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [{ alg: -7 }], ...extra });
+const dup = await sendRuntime({ bwliteReq: 'rp-dup', kind: 'create', options: create() },
+  { origin: 'https://login.github.io', tab: { id: 1 }, url: 'https://login.github.io/' });
+assert.equal(dup.error?.name, 'NotAllowedError', 'a second passkey request from the same tab opens no window');
+const windowsBeforeL3 = createdWindows.length;
+await sendRuntime({ bwliteReq: 'rp-cable', kind: 'get', options: { challenge: 'c', allowCredentials: [{ id: 'x', transports: ['cable'] }] } },
+  { origin: 'https://login.github.io', tab: { id: 4 }, url: 'https://login.github.io/' });
+await sendRuntime({ bwliteReq: 'rp-noparams', kind: 'create', options: create({ pubKeyCredParams: [] }) },
+  { origin: 'https://login.github.io', tab: { id: 5 }, url: 'https://login.github.io/' });
+assert.equal(createdWindows.length, windowsBeforeL3 + 2, 'unknown transports and empty pubKeyCredParams open BW Lite');
+for (const k of sessionStore.data.keys()) if (k.startsWith('pk:')) sessionStore.data.delete(k);
 const before = sentTabs.length;
 await sendRuntime({ bwliteSubmit: { username: 'alice', password: '' } }, { tab: { id: 7 }, url: 'https://one.example/login' });
 await sessionStore.set({ 'b:list': JSON.stringify([{ id: 'b1', name: 'B', username: 'bob', password: 'old', uris: ['https://two.example'] }]) });
@@ -317,6 +346,18 @@ assert.equal(openedSave.opened, true, 'a trusted page click opens the extension 
 assert.match(createdWindows.at(-1).url, /^popup\.html#save=/);
 assert.equal((await sendRuntime({ bwliteSaveOpen: offerKey }, { tab: { id: 7 }, frameId: 0, url: 'https://two.example/home' })).fallback, true,
   'a save offer is single-use');
+await sendRuntime({ bwliteSubmit: { username: 'carol', password: '' } }, { tab: { id: 7 }, url: 'https://login.two.example/' });
+assert.equal(sessionStore.data.get('pending:7')?.username, 'carol', 'the username step outlives the service worker');
+await sendRuntime({ bwliteSubmit: { username: '', password: 'pw2' } }, { tab: { id: 7 }, url: 'https://login.two.example/password' });
+const subBefore = sentTabs.length;
+await tabUpdates[0](7, { status: 'complete' }, { id: 7, url: 'https://app.two.example/home', status: 'complete' });
+assert.equal(sentTabs.length, subBefore + 1, 'a sign-in that lands on another subdomain is offered');
+const subKey = sentTabs.at(-1)[1].bwliteBar;
+assert.equal(sessionStore.data.get(`save:${subKey}`).username, 'carol', 'a two-step login keeps its username');
+assert.equal(sessionStore.data.get(`save:${subKey}`).origin, 'https://login.two.example', 'the offer saves the sign-in page');
+assert.equal(sessionStore.data.has('pending:7'), false, 'a pending login is offered once');
+assert.equal((await sendRuntime({ bwliteSaveOpen: subKey }, { tab: { id: 7 }, frameId: 0, url: 'https://two.example/home' })).opened, true,
+  'the save offer opens from another page of the same site');
 console.log('background cache, write, RP, and save-scope checks ok');
 
 // Source-loaded popup harness. It evaluates the production popup code in a
@@ -326,7 +367,7 @@ const popupSource = await readFile('./popup.js', 'utf8');
 const popupProgram = popupSource
   .replace(/^import[^\n]*\n/gm, '')
   .replace(/\nstart\(\)\.catch\([\s\S]*\);\s*$/, '\n')
-  + `\nthis.__popup = { start, move, adoptAccounts, closeSave, getAccounts: () => accounts, getPk: () => pk, getSv: () => sv, getApp: () => app };\n`;
+  + `\nthis.__popup = { start, move, adoptAccounts, closeSave, loginView, getAccounts: () => accounts, getPk: () => pk, getSv: () => sv, getApp: () => app };\n`;
 
 function popupStorage(name, initial, notify) {
   const data = new Map(Object.entries(initial || {}));
@@ -445,7 +486,7 @@ function makePopup(hash, initial = {}, options = {}) {
 }
 
 const pkRequest = { id: 'request', kind: 'get', options: { challenge: 'c', rpId: 'example.com' },
-  origin: 'https://example.com', rpId: 'example.com', tabId: 9 };
+  origin: 'https://example.com', rpId: 'example.com', tabId: 9, expires: Date.now() + 60e3 };
 const listenerPopup = makePopup('#pk=handoff', { session: { 'pk:handoff': pkRequest } });
 await listenerPopup.api.start();
 await listenerPopup.session.set({ 'unrelated:key': 'still-open' });
@@ -476,6 +517,23 @@ await useButton.onclick({ isTrusted: true });
 assert.equal(passkeyCalls, 1, 'Use invokes passkey signing');
 assert.equal(passkeyPopup.sent.at(-1)[1].bwliteRes, 'use-request', 'passkey Use answers the originating request');
 assert.deepEqual(passkeyPopup.sent.at(-1)[1].result, { id: 'credential-result' });
+const expiryPk = makePopup('#pk=expiry', { session: { 'pk:expiry': { ...pkRequest, id: 'expiry-request', expires: Date.now() + 20 } } });
+await expiryPk.api.start();
+await new Promise((resolve) => setTimeout(resolve, 40));
+assert.equal(expiryPk.closed, true, 'a passkey window closes at its deadline');
+assert.equal(expiryPk.sent.at(-1)[1].error.name, 'NotAllowedError', 'the page hears the timeout');
+assert.equal(JSON.stringify(expiryPk.sent.at(-1)[2]), '{"frameId":0}','no documentId means no documentId option (Firefox < 153)');
+// A create excluded by a BW Lite passkey still offers the security key; a locked second vault offers unlock.
+const excludePk = makePopup('#pk=exclude', {
+  local: { accounts: [passkeyAccount, popupAccount('locked')] },
+  session: { 'acct:key': popupKey, 'acct:list': JSON.stringify(passkeyItem), 'pk:exclude': { ...pkRequest, kind: 'create',
+    options: { challenge: 'c', rp: { name: 'x' }, user: { id: 'u', name: 'u' }, pubKeyCredParams: [],
+      excludeCredentials: [{ id: bw.b64u(bw.credIdBytes('b64.AAEC')), type: 'public-key' }] } } },
+});
+await excludePk.api.start();
+assert.ok(!excludePk.closed && findButton(excludePk.app, 'Use device or security key'), 'an excluded create is not auto-answered');
+assert.equal(findButton(excludePk.app, 'Save as new login'), null, 'an excluded create offers no save');
+assert.ok(findButton(excludePk.app, '1 locked'), 'a locked vault can be unlocked from the passkey window');
 
 // Opening the popup syncs a vault last synced over 5 minutes ago in the background; a recent one is left alone.
 const textOf = (node) => `${node?.textContent || ''} ${(node?.children || []).map(textOf).join(' ')}`;
@@ -546,13 +604,56 @@ const framedSave = makePopup('#save=framed', {
 await framedSave.api.start();
 assert.equal(framedSave.closed, true, 'a web frame cannot render the save confirmation');
 assert.equal(framedSave.parentMessages.length, 0);
+
+// Logging in to a vault that is already added (master password changed elsewhere) updates it in place.
+const loginCalls = [];
+const reloginPopup = makePopup('', { local: { accounts: [{ ...popupAccount('acct', 'Vault'), protectedKey: 'old-pk' }], deviceId: 'dev' } }, { bw: {
+  login: async (...args) => (loginCalls.push(args), { kdf: { kdf: 0, kdfIterations: 1 }, protectedKey: 'new-pk', userKey: new Uint8Array(64),
+    tokens: { access: 't', refresh: 'r', expires: Date.now() + 3600e3 }, twoFactorToken: loginCalls.length === 1 ? 'remember-me' : undefined }),
+  api: async () => ({ ciphers: [], profile: {}, domains: {} }), decryptVault: async () => [] } });
+const relogin = async () => {
+  reloginPopup.api.loginView();
+  const form = reloginPopup.app.children[1];
+  form.children[1].children[0].value = 'ACCT@example.com';
+  form.children[2].children[0].value = 'new password';
+  form.listeners.submit({ preventDefault() {} });
+  for (let i = 0; i < 50 && !findById(reloginPopup.app, 'search'); i++) await new Promise((r) => setTimeout(r, 5));
+};
+await reloginPopup.api.start();
+await relogin();
+await relogin();
+const [patched, ...added] = (await reloginPopup.local.get('accounts')).accounts;
+assert.equal(added.length, 0, 'logging in to an added vault does not add it twice');
+assert.deepEqual([patched.id, patched.label, patched.protectedKey, patched.twoFactorToken], ['acct', 'Vault', 'new-pk', 'remember-me']);
+assert.equal(loginCalls[1][5], 'remember-me', 'the next login sends the remembered 2FA token');
+assert.equal(reloginPopup.session.data.get('acct:key'), popupKey, 'the vault opens with the new key');
+
+// Re-prompt logins ask for the master password before the password is copied; a policy-hidden password has no copy button.
+const buttonsOf = (node, text) => [...(node?.tagName === 'BUTTON' && node.textContent === text ? [node] : []), ...(node?.children || []).flatMap((c) => buttonsOf(c, text))];
+const rpItems = [{ ...popupList('rp')[0], id: 'r', username: 'ruser', reprompt: true }, { ...popupList('rp')[0], id: 'v', username: 'vuser', viewPassword: false }];
+const rpPopup = makePopup('', { local: { accounts: [{ ...popupAccount('rp'), lastSync: Date.now() }] }, session: { 'rp:key': popupKey, 'rp:list': JSON.stringify(rpItems) } },
+  { bw: { unlock: async (pw) => new Uint8Array(64).fill(pw === 'right' ? 0 : 1) } });
+await rpPopup.api.start();
+const copied = [];
+rpPopup.context.navigator.clipboard.writeText = async (t) => { copied.push(t); };
+const passButtons = buttonsOf(rpPopup.app, 'pass');
+assert.equal(passButtons.length, 1, 'viewPassword: false hides the copy button');
+passButtons[0].onclick({ target: passButtons[0] });
+const rpForm = rpPopup.app.children[1];
+for (const pw of ['wrong', 'right']) {
+  rpForm.children[0].children[0].value = pw;
+  rpForm.listeners.submit({ preventDefault() {} });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(copied, pw === 'right' ? ['pass'] : [], `copies only after the right master password (${pw})`);
+}
 console.log('popup storage, passkey, account, save-window, and move checks ok');
 // page.js: the credential it hands the page takes the toJSON that @github/webauthn-json assigns (in strict mode).
 {
   const listeners = [];
   const ctx = {
     btoa, atob, crypto, setTimeout, clearTimeout, DOMException,
-    PublicKeyCredential: class {}, AuthenticatorAssertionResponse: class {}, AuthenticatorAttestationResponse: class {},
+    PublicKeyCredential: class { static async getClientCapabilities() { return { conditionalGet: true }; } },
+    AuthenticatorAssertionResponse: class {}, AuthenticatorAttestationResponse: class {},
     navigator: { credentials: { create: async () => null, get: async () => null } },
     addEventListener: (_, f) => listeners.push(f), removeEventListener: () => {},
     postMessage: (m) => queueMicrotask(() => listeners.forEach((f) => f({ source: vm.runInContext('window', ctx), data: { bwliteRes: m.bwliteReq, result: {
@@ -564,11 +665,15 @@ console.log('popup storage, passkey, account, save-window, and move checks ok');
   const cred = await ctx.navigator.credentials.get({ publicKey: { challenge: new Uint8Array([1]) } });
   assert.doesNotThrow(() => { 'use strict'; cred.toJSON = () => 'mine'; }, 'credential.toJSON is assignable');
   assert.equal(cred.toJSON(), 'mine');
+  assert.equal(await ctx.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(), true, 'sites see a platform authenticator');
+  assert.equal(JSON.stringify(await ctx.PublicKeyCredential.getClientCapabilities()), '{"conditionalGet":true,"userVerifyingPlatformAuthenticator":true}',
+    'client capabilities keep the native fields and add the platform authenticator');
   console.log('page credential checks ok');
 }
 const inpageSource = await readFile('./inpage.js', 'utf8');
 assert.equal(inpageSource.includes('popup.html#save='), false, 'the page bar cannot frame the extension popup');
 assert.equal(inpageSource.includes('attachShadow({ mode: \'closed\' })'), true, 'the save token stays in a closed extension bar');
+assert.match(inpageSource, /addEventListener\('click', async \(e\) => \{[^}]*elementFromPoint/, 'a menu click fills only when it hit the visible menu');
 
 if (!process.argv.includes('--integration')) process.exit(0);
 

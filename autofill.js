@@ -3,8 +3,8 @@ import { matches } from './bw.js';
 
 // Fills every frame of the tab whose own URL matches the login, so a login form in an iframe is reached but a frame
 // from another site never gets the password. code: TOTP to put on the clipboard from the page.
-export async function fillTab(tabId, item, equiv, code = null, guard = async () => true, documentId = null) {
-  const all = documentId ? { tabId, documentIds: [documentId] } : { tabId, allFrames: true };
+export async function fillTab(tabId, item, equiv, code = null, guard = async () => true) {
+  const all = { tabId, allFrames: true };
   if (!await guard()) return false;
   await chrome.scripting.executeScript({ target: all, files: ['inpage.js'] });
   if (!await guard()) return false;

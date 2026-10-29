@@ -2,21 +2,31 @@
 // shows the "save this login?" bar (popup.html in a frame). fillTab (autofill.js) also injects it into tabs opened
 // before the extension was loaded, hence the guard.
 if (!globalThis.bwliteFill) {
-  const visible = (i) => !i.disabled && !i.readOnly && i.getClientRects().length;
-  // loose: with no password field, fall back to the first text field (the username step of a two-step login).
+  // off-screen, invisible or untabbable fields are honeypots, not the username. Not opacity: sites animate it.
+  const visible = (i) => {
+    if (i.disabled || i.readOnly || i.tabIndex === -1) return false;
+    const r = i.getBoundingClientRect();
+    return r.width > 0 && r.right + scrollX > 0 && r.bottom + scrollY > 0 && getComputedStyle(i).visibility !== 'hidden'; // page, not viewport: scrolled-off fields are real
+  };
+  // Only the focused field's form, so a search box elsewhere on the page is never taken for the username.
+  // loose: with no password field, fall back to the only text field (the username step of a two-step login).
   // ponytail: fields inside shadow DOM aren't seen.
   const loginFields = (loose) => {
-    const all = [...document.querySelectorAll('input')].filter(visible), pw = all.find((i) => i.type === 'password');
+    const root = document.activeElement?.closest('form') || document;
+    const all = [...root.querySelectorAll('input')].filter(visible), pw = all.find((i) => i.type === 'password');
     const texts = (pw ? all.slice(0, all.indexOf(pw)) : all).filter((i) => ['text', 'email', 'tel'].includes(i.type));
-    const user = pw ? texts.at(-1) : texts.find((i) => i.type === 'email' || /user|email|login/i.test(i.autocomplete + i.name + i.id)) || (loose && texts[0]);
+    const user = pw ? texts.at(-1) : texts.find((i) => i.type === 'email' || /user|email|login/i.test(i.autocomplete + i.name + i.id)) || (loose && texts.length === 1 && texts[0]);
     return { all, user, pw };
   };
 
+  let filling = false; // the fill focuses the fields; that must not reopen the menu under them
   globalThis.bwliteFill = (username, password, code) => {
     const { user, pw } = loginFields(true);
     let filled = false;
     const set = (el, v) => {
+      filling = true;
       el.focus();
+      filling = false;
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -53,6 +63,9 @@ if (!globalThis.bwliteFill) {
       b.append(el('b', l.username || '(no username)'), el('small', l.name));
       b.addEventListener('click', async (e) => {
         if (!e.isTrusted) return;
+        // the page can focus the field itself, hide this menu and draw a decoy under it: fill only a click on the visible menu
+        const cs = getComputedStyle(menu);
+        if (cs.opacity !== '1' || cs.visibility !== 'visible' || document.elementFromPoint(e.clientX, e.clientY) !== menu) return closeMenu();
         closeMenu();
         const c = await chrome.runtime.sendMessage({ bwliteFillKey: l.k }).catch(() => null);
         if (c) bwliteFill(c.username, c.password, c.code);
@@ -62,7 +75,7 @@ if (!globalThis.bwliteFill) {
     document.documentElement.append(menu);
   }
   async function maybeShow(f) {
-    if (f === menuFor) return;
+    if (filling || f === menuFor) return;
     closeMenu();
     const { user, pw } = loginFields(false);
     if ((f !== user && f !== pw) || f.autocomplete === 'new-password') return;
@@ -80,7 +93,7 @@ if (!globalThis.bwliteFill) {
 
   // --- logins being submitted: background.js offers to save them after the page navigates
   function capture() {
-    const { all, user } = loginFields(false);
+    const { all, user } = loginFields(true);
     const pws = all.filter((i) => i.type === 'password' && i.value);
     const username = user?.value.trim() || '';
     // no password yet: the username step of a two-step login, remembered for the password step

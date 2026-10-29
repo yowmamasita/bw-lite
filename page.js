@@ -36,7 +36,9 @@
     const id = crypto.randomUUID();
     const done = (r) => (removeEventListener('message', on), clearTimeout(t), resolve(r));
     const on = (e) => e.source === window && e.data?.bwliteRes === id && done(e.data);
-    const t = setTimeout(() => done({ error: { name: 'NotAllowedError', message: 'Timed out' } }), publicKey.timeout || 300e3);
+    // background.js gives the window the same clamped deadline; the 5 s slack lets the window's answer arrive first
+    const t = setTimeout(() => done({ error: { name: 'NotAllowedError', message: 'Timed out' } }),
+      Math.min(Math.max(Number(publicKey.timeout) || 300e3, 60e3), 600e3) + 5e3);
     addEventListener('message', on);
     postMessage({ bwliteReq: id, kind, options: toJSON(publicKey) }, '*');
   });
@@ -51,4 +53,8 @@
   };
   c.create = wrap('create');
   c.get = wrap('get');
+  // BW Lite is a user-verifying platform authenticator, so sites offer passkey creation even without Hello / Touch ID.
+  PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = async () => true;
+  const caps = PublicKeyCredential.getClientCapabilities?.bind(PublicKeyCredential);
+  if (caps) PublicKeyCredential.getClientCapabilities = async () => ({ ...await caps(), userVerifyingPlatformAuthenticator: true });
 })();

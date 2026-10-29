@@ -26,7 +26,7 @@ function h(tag, props = {}, ...kids) {
     if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else if (v != null && v !== false) el[k] = v;
   }
-  el.append(...kids.flat().filter((k) => k != null && k !== false && k !== ''));
+  el.append(...kids.flat().filter((k) => k != null && k !== false && k !== '' && k !== 0)); // `n && node` children
   return el;
 }
 const field = (label, el) => h('label', {}, label, el);
@@ -148,6 +148,7 @@ async function start() {
     }
     tab = { id: pk.tabId, url: pk.origin };
     addEventListener('pagehide', () => answer(CANCEL)); // closing the window cancels
+    pkTimer = setTimeout(() => answer(TIMEOUT), pk.expires - Date.now()); // a missing expires times out at once
   }
   if (mode === 'save') {
     if (!(sv = s[`save:${modeKey}`])) return closeSave();
@@ -259,7 +260,7 @@ function merge() {
 // Loads every unlocked account that isn't loaded yet; one failing account doesn't block the others.
 async function loadVaults(s = {}) {
   const todo = unlocked().filter((a) => !lists[a.id]);
-  const res = await Promise.allSettled(todo.map((a) => accountTask(a, () => loadAccount(a, s))));
+  const res = await Promise.allSettled(todo.map((a) => accountTask(a, () => loadAccount(a, s)).then((r) => r === 'sync' && syncAccount(a))));
   merge();
   return failures(todo, res);
 }
@@ -279,7 +280,7 @@ async function loadAccount(a, s) {
   const { [`${a.id}:index4`]: index } = await local.get(`${a.id}:index4`);
   if (!index) {
     await local.remove([`${a.id}:index`, `${a.id}:index2`, `${a.id}:index3`]);
-    return syncAccountNow(a);
+    return 'sync'; // loadVaults syncs it after the lock is released
   }
   try {
     const cached = JSON.parse(td.decode(await bw.decrypt(index, keys[a.id])));
@@ -287,7 +288,7 @@ async function loadAccount(a, s) {
     await setList(a, cached, false);
   } catch {
     await local.remove([`${a.id}:index`, `${a.id}:index2`, `${a.id}:index3`, `${a.id}:index4`]);
-    return syncAccountNow(a);
+    return 'sync'; // loadVaults syncs it after the lock is released
   }
 }
 
@@ -301,11 +302,14 @@ const failures = (todo, res) =>
   res.map((r, i) => r.status === 'rejected' && `${todo[i].label}: ${r.reason?.message || String(r.reason)}`).filter(Boolean).join('\n');
 
 // Sync button / Ctrl+S, refreshStale() on open, and an account with no local data yet. Unchanged items aren't decrypted again.
-const syncAccount = (a) => accountTask(a, () => syncAccountNow(a));
-async function syncAccountNow(a) {
-  const p = `${a.id}:`;
+// The download runs outside the state lock so background.js (autofill, badge) isn't blocked while it waits on the network.
+const syncAccount = async (a) => {
   if (acct(a.id) !== a || !keys[a.id]) return;
-  const sync = await bw.api(sess(a, true), '/sync');
+  const sync = await bw.api(sess(a), '/sync');
+  return accountTask(a, () => syncAccountNow(a, sync));
+};
+async function syncAccountNow(a, sync) {
+  const p = `${a.id}:`;
   if (acct(a.id) !== a || !keys[a.id]) return;
   const prev = new Map((Array.isArray(lists[a.id]) ? lists[a.id] : []).map((i) => [i.id, i]));
   const items = (await bw.decryptVault(sync, keys[a.id], prev)).map((i) => ({ ...strip(i), a: a.id }));
@@ -317,7 +321,9 @@ async function syncAccountNow(a) {
   await local.remove(old.filter((id) => !keep.has(id)).map((id) => `${p}c:${id}`));
   const d = sync.domains || {};
   const eq = [...(d.equivalentDomains || []), ...(d.globalEquivalentDomains || []).filter((g) => !g.excluded).map((g) => g.domains)];
-  await local.set({ [`${p}profile`]: sync.profile, [`${p}ids`]: ids, [`${p}eq`]: eq, ...Object.fromEntries(sync.ciphers.map((c) => [`${p}c:${c.id}`, c])) });
+  // only what decrypting needs; the rest of the profile (hint, names, security stamp) stays off disk
+  const profile = { privateKey: sync.profile.privateKey, organizations: (sync.profile.organizations || []).map(({ id, key }) => ({ id, key })) };
+  await local.set({ [`${p}profile`]: profile, [`${p}ids`]: ids, [`${p}eq`]: eq, ...Object.fromEntries(sync.ciphers.map((c) => [`${p}c:${c.id}`, c])) });
   await setList(a, items);
   await patchAccountsUnlocked(a.id, { lastSync: Date.now() });
   await loadEquiv();
@@ -365,12 +371,14 @@ function loginView() {
       e.preventDefault();
       run(btn, err, async () => {
         const srv = server.value.trim().replace(/\/+$/, ''), mail = email.value.trim();
-        if (accounts.some((a) => a.server === srv && a.email.toLowerCase() === mail.toLowerCase())) throw new Error('This vault is already added');
+        // the same vault again (after a master password or KDF change elsewhere) is logged in again in place
+        const old = accounts.find((a) => a.server === srv && a.email.toLowerCase() === mail.toLowerCase());
         if (!st.deviceId) await local.set({ deviceId: (st.deviceId = crypto.randomUUID()) }); // one id per install avoids new-device emails
         try {
-          const r = await bw.login(srv, mail, pw.value, st.deviceId, need && { kind: need, value: code.value.trim() });
-          const a = { id: newId(), server: srv, email: mail, label: label.value.trim() || mail, kdf: r.kdf, protectedKey: r.protectedKey, tokens: r.tokens };
-          await updateAccounts((list) => [...list, a]);
+          const r = await bw.login(srv, mail, pw.value, st.deviceId, need && { kind: need, value: code.value.trim() }, old?.twoFactorToken);
+          const fields = { kdf: r.kdf, protectedKey: r.protectedKey, tokens: r.tokens, ...(r.twoFactorToken && { twoFactorToken: r.twoFactorToken }) };
+          const a = old || { id: newId(), server: srv, email: mail, label: label.value.trim() || mail, ...fields };
+          await (old ? update(old, fields) : updateAccounts((list) => [...list, a]));
           await setKey(a, r.userKey);
           await syncAccount(a);
           merge();
@@ -403,8 +411,8 @@ function unlockView() {
       e.preventDefault();
       run(btn, err, async () => {
         const opened = await Promise.all(todo.map((a) =>
-          bw.unlock(pw.value, a.email, a.kdf, a.protectedKey).then((k) => setKey(a, k).then(() => true), () => false)));
-        if (!opened.includes(true)) throw new Error('Wrong master password');
+          bw.unlock(pw.value, a.email, a.kdf, a.protectedKey).then((k) => setKey(a, k)).then(() => true, (e) => e)));
+        if (!opened.includes(true)) throw new Error([...new Set(opened.map((e) => e?.message || String(e)))].join('\n'));
         const problems = await loadVaults();
         vaultView();
         if (problems) status(problems);
@@ -525,7 +533,28 @@ async function loadItem(i) {
   const k = `${i.a}:c:${i.id}`;
   return fullItem(acct(i.a), (await local.get(k))[k]);
 }
-const openEdit = async (i) => editView(await loadItem(i));
+const openEdit = async (i, confirmed) => (i.reprompt && !confirmed ? repromptView(i, () => openEdit(i, true).catch((e) => status(e.message))) : editView(await loadItem(i)));
+
+// Bitwarden's master password re-prompt: the password must open this vault's key again, then the list comes back and next runs.
+function repromptView(i, next) {
+  const a = acct(i.a);
+  const pw = h('input', { type: 'password', required: true });
+  const btn = h('button', { className: 'primary' }, 'Continue');
+  const err = h('p', { className: 'err' });
+  const form = h('form', {
+    onsubmit: (e) => {
+      e.preventDefault();
+      run(btn, err, async () => {
+        const k = a && keys[a.id] && await bw.unlock(pw.value, a.email, a.kdf, a.protectedKey);
+        if (!k || !keys[a.id] || bw.b64(k) !== bw.b64(keys[a.id])) throw new Error('Wrong master password');
+        vaultView();
+        await next();
+      });
+    },
+  }, field(`Master password for ${i.name || 'this login'}`, pw), h('div', { className: 'inline' }, btn, h('button', { type: 'button', onclick: vaultView }, 'Cancel')), err);
+  app.replaceChildren(title('BW Lite'), form);
+  pw.focus();
+}
 
 // Applies a saved cipher from the server's reply locally, no full sync needed.
 async function storeCipher(a, raw) {
@@ -541,12 +570,11 @@ async function storeCipher(a, raw) {
 
 async function deleteItem(item) {
   const a = acct(item.a);
-  if (!a) return;
+  if (!a || !keys[a.id]) return;
+  await bw.deleteCipher(sess(a), item.id); // outside the lock, like syncAccount
   await accountTask(a, async () => {
     if (acct(a.id) !== a || !keys[a.id]) return;
     const p = `${a.id}:`;
-    await bw.deleteCipher(sess(a, true), item.id);
-    if (acct(a.id) !== a || !keys[a.id]) return;
     const stored = await local.get(`${p}ids`);
     const ids = Array.isArray(stored[`${p}ids`]) ? stored[`${p}ids`] : [];
     await local.remove(`${p}c:${item.id}`);
@@ -559,20 +587,20 @@ async function deleteItem(item) {
 
 async function saveItem(a, item, value, authorize = async () => true) {
   let saved = false;
+  if (acct(a.id) !== a || !keys[a.id]) return saved;
+  if (item && (!item.raw || item.raw.edit === false)) throw new Error(item?.raw?.edit === false ? 'This login is read-only' : 'Login is no longer available; sync and try again');
+  // Keep the revision captured when the edit form opened. Reloading a newer
+  // raw cipher here would turn a concurrent edit into an overwrite instead
+  // of letting the server's lastKnownRevisionDate reject it.
+  if (!await authorize()) return saved;
+  let raw;
+  try {
+    raw = await bw.saveCipher(sess(a), keys[a.id], item, value); // outside the lock, like syncAccount
+  } catch (e) {
+    if (/\(409\)/.test(e?.message || '')) throw new Error('Login changed elsewhere; sync and try again');
+    throw e;
+  }
   await accountTask(a, async () => {
-    if (acct(a.id) !== a || !keys[a.id]) return;
-    if (item && (!item.raw || item.raw.edit === false)) throw new Error(item?.raw?.edit === false ? 'This login is read-only' : 'Login is no longer available; sync and try again');
-    // Keep the revision captured when the edit form opened. Reloading a newer
-    // raw cipher here would turn a concurrent edit into an overwrite instead
-    // of letting the server's lastKnownRevisionDate reject it.
-    if (!await authorize()) return;
-    let raw;
-    try {
-      raw = await bw.saveCipher(sess(a, true), keys[a.id], item, value);
-    } catch (e) {
-      if (/\(409\)/.test(e?.message || '')) throw new Error('Login changed elsewhere; sync and try again');
-      throw e;
-    }
     if (!await authorize()) return;
     const sessionKey = await session.get(`${a.id}:key`);
     if (acct(a.id) === a && keys[a.id] && sessionKey[`${a.id}:key`] === bw.b64(keys[a.id])) {
@@ -595,16 +623,17 @@ async function copy(btn, text) {
   setTimeout(() => (btn.textContent = old), 1000);
 }
 
-async function fill(item) {
+async function fill(item, confirmed) {
   const key = keys[item.a];
   if (!key) return status('Vault locked; unlock it before filling');
+  if (item.reprompt && !confirmed) return repromptView(item, () => fill(item, true));
   let code = null;
   if (item.totp) code = (await bw.totp(item.totp).catch(() => null))?.code;
   const guard = async () => {
     const current = await session.get(`${item.a}:key`);
     return keys[item.a] === key && current[`${item.a}:key`] === bw.b64(key);
   };
-  const ok = await fillTab(tab.id, item, equiv.get(item.a), code, guard, tab.documentId).catch((e) => status(e.message));
+  const ok = await fillTab(tab.id, item, equiv.get(item.a), code, guard).catch((e) => status(e.message));
   if (!ok) return ok === false && status('No login form for this login on the page');
   if (!await guard()) return status('Vault locked before filling finished');
   await markUsed(item); // before the clipboard, which can throw and leave the fill unrecorded
@@ -645,7 +674,8 @@ function vaultView() {
     h('div', { className: 'actions' },
       here.includes(i) && h('button', { className: i === top ? 'primary' : '', title: i === top ? 'Fill (Enter)' : 'Fill', onclick: () => fill(i) }, 'Fill'),
       i.username && quiet('user', 'Copy username', (e) => copy(e.target, i.username)),
-      i.password && quiet('pass', 'Copy password', (e) => copy(e.target, i.password)),
+      i.password && i.viewPassword !== false && quiet('pass', 'Copy password',
+        (e) => (i.reprompt ? repromptView(i, () => copy(e.target, i.password).then(() => status('Password copied'))) : copy(e.target, i.password))),
       quiet('edit', 'Edit', () => openEdit(i).catch((e) => status(e.message)))));
   const draw = () => {
     const s = q.value.trim().toLowerCase();
@@ -720,7 +750,8 @@ function editView(item) {
   if (mode === 'save') return closeSave();
   const name = h('input', { value: item ? item.name : host || '', required: true });
   const user = h('input', { value: item?.username || '' });
-  const pass = h('input', { type: 'password', value: item?.password || '' });
+  const hidden = item?.viewPassword === false; // hidden by an organization policy: left empty, the saved one is kept
+  const pass = h('input', { type: 'password', value: hidden ? '' : item?.password || '', placeholder: hidden ? 'Hidden by your organization' : null });
   const totp = h('input', { value: item?.totp || '', placeholder: 'Secret or otpauth:// URI' });
   const uris = h('textarea', { rows: 2, value: (item ? item.uris : host ? [new URL(tab.url).origin] : []).join('\n'), placeholder: 'One URL per line' });
   const notes = h('textarea', { rows: 3, value: item?.notes || '' });
@@ -741,7 +772,7 @@ function editView(item) {
         if (totp.value.trim()) await bw.totp(totp.value.trim()); // reject a bad secret before saving it
         const a = acct(item?.a || (target ? target.value : unlocked()[0].id));
         if (!await saveItem(a, item, {
-          name: name.value.trim(), username: user.value, password: pass.value, totp: totp.value.trim(), notes: notes.value,
+          name: name.value.trim(), username: user.value, password: hidden && !pass.value ? item.password : pass.value, totp: totp.value.trim(), notes: notes.value,
           uris: uris.value.split('\n').map((u) => u.trim()).filter(Boolean),
         })) throw new Error('Vault locked or removed before the save finished');
         vaultView();
@@ -760,6 +791,8 @@ function editView(item) {
 }
 
 const CANCEL = { error: { name: 'NotAllowedError', message: 'Cancelled' } };
+const TIMEOUT = { error: { name: 'NotAllowedError', message: 'Timed out' } };
+let pkTimer;
 
 function closeSave() {
   const active = !!sv;
@@ -794,14 +827,19 @@ async function answer(res) {
   if (!pk) return;
   const { id, tabId, documentId } = pk;
   pk = null;
-  const handoff = await session.get(`pk:${modeKey}`).catch(() => ({}));
-  if (handoff[`pk:${modeKey}`]?.id !== id && res !== CANCEL) return window.close();
-  // the page's own passkey UI needs its window focused
-  if (res.fallback) {
-    const t = await chrome.tabs.get(tabId).catch(() => null);
-    if (t) await chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
+  clearTimeout(pkTimer);
+  // Cancel and timeout go out before any await: on pagehide (window closed) the document is gone after the first one.
+  if (!res.error) {
+    const handoff = await session.get(`pk:${modeKey}`).catch(() => ({}));
+    if (handoff[`pk:${modeKey}`]?.id !== id) return window.close();
+    // the page's own passkey UI needs its window focused
+    if (res.fallback) {
+      const t = await chrome.tabs.get(tabId).catch(() => null);
+      if (t) await chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
+    }
   }
-  chrome.tabs.sendMessage(tabId, { bwliteRes: id, ...res }, { documentId }).catch(() => {});
+  // Firefox before 153 rejects a documentId option, even an undefined one; bridge.js runs only in the top frame.
+  chrome.tabs.sendMessage(tabId, { bwliteRes: id, ...res }, documentId ? { documentId } : { frameId: 0 }).catch(() => {});
   session.remove(`pk:${modeKey}`);
   window.close();
 }
@@ -830,7 +868,8 @@ function passkeyView() {
     const current = await session.get(`${id}:key`);
     return !!id && !!keys[id] && current[`${id}:key`] === bw.b64(keys[id]);
   };
-  const ids = (list) => new Set((Array.isArray(list) ? list : []).filter((c) => c && typeof c.id === 'string').map((c) => c.id));
+  const ids = (list) => new Set((Array.isArray(list) ? list : [])
+    .filter((c) => c && typeof c.id === 'string' && (c.type ?? 'public-key') === 'public-key').map((c) => c.id));
   const mine = vault.flatMap((i) => (i.passkeys || []).filter((p) => typeof p.rpId === 'string' && p.rpId.toLowerCase() === rpId).map((p) => {
     try { return { i, p, id: bw.b64u(bw.credIdBytes(p.credentialId)) }; } catch { return null; }
   }).filter(Boolean));
@@ -838,11 +877,14 @@ function passkeyView() {
     h('button', { type: 'button', onclick: () => answer({ fallback: true }) }, 'Use device or security key'),
     h('button', { type: 'button', onclick: () => answer(CANCEL) }, 'Cancel'));
   const show = (heading, text, rows, extra = '') =>
-    (app.replaceChildren(title(heading), h('p', { className: 'muted' }, text), h('div', { className: 'list' }, rows), extra, others, err), fitWindow());
+    (app.replaceChildren(title(heading), h('p', { className: 'muted' }, text, ' ',
+      locked().length && h('button', { className: 'link', onclick: unlockView }, `${locked().length} locked`)),
+    h('div', { className: 'list' }, rows), extra, others, err), fitWindow());
 
   if (kind === 'get') {
     const allow = ids(o.allowCredentials);
-    const rows = mine.filter((m) => !allow.size || allow.has(m.id)).map(({ i, p }) =>
+    // a non-empty allow list stays a restriction even when all its entries are of an unknown type
+    const rows = mine.filter((m) => !o.allowCredentials?.length || allow.has(m.id)).map(({ i, p }) =>
       pkRow(p.userName || i.username || '(no username)', `${i.name}${multi ? ` · ${acct(i.a)?.label}` : ''}`,
         action('Use', true, async () => {
           const result = await bw.passkeyGet(p, o, origin);
@@ -854,13 +896,15 @@ function passkeyView() {
   }
 
   const exclude = ids(o.excludeCredentials);
-  if (mine.some((m) => exclude.has(m.id))) return answer({ error: { name: 'InvalidStateError', message: 'This passkey is already saved' } });
+  // no auto-answer: the user may still want to add a security key next to it
+  if (mine.some((m) => exclude.has(m.id))) return show('Save passkey', 'This site\'s passkey is already in BW Lite.', []);
   const save = async (a, item) => {
     if (!a || !await authorized(a)) return answer(CANCEL);
     const { passkey, result } = await bw.passkeyCreate(o, origin, rpId);
     if (!await authorized(a)) return answer(CANCEL);
     const v = item ? { ...item, passkey }
       : { name: o.rp.name || rpId, username: o.user.name || '', password: '', totp: '', notes: '', uris: [origin], passkey };
+    if (!pk) return; // timed out or cancelled meanwhile: never store a passkey the site won't receive
     if (!await saveItem(a, item, v)) return answer(CANCEL);
     if (!await authorized(a)) return answer(CANCEL);
     answer({ result });

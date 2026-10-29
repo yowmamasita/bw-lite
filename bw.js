@@ -111,7 +111,8 @@ export async function prelogin(server, email) {
 const tokens = (j) => ({ access: j.access_token, refresh: j.refresh_token, expires: Date.now() + j.expires_in * 1000 });
 
 // code: {kind: '2fa' | 'device', value} on the second attempt, after login threw an error with .need set.
-export async function login(server, email, password, deviceId, code) {
+// remember: the twoFactorToken an earlier 2FA login returned, tried before asking for a code.
+export async function login(server, email, password, deviceId, code, remember) {
   const kdf = await prelogin(server, email);
   const mk = await makeMasterKey(password, email, kdf);
   const body = new URLSearchParams({
@@ -119,6 +120,7 @@ export async function login(server, email, password, deviceId, code) {
     client_id: 'browser', deviceType: '2', deviceIdentifier: deviceId, deviceName: 'chrome',
   });
   if (code?.kind === '2fa') body.append('twoFactorToken', code.value), body.append('twoFactorProvider', '0'), body.append('twoFactorRemember', '1');
+  else if (remember) body.append('twoFactorToken', remember), body.append('twoFactorProvider', '5'); // 5 = remember; a stale one gets the 2FA prompt again
   if (code?.kind === 'device') body.append('newDeviceOtp', code.value);
   const authEmail = btoa(email).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const r = await post(`${urls(server).identity}/connect/token`, body, { 'Content-Type': 'application/x-www-form-urlencoded', 'Auth-Email': authEmail });
@@ -133,7 +135,7 @@ export async function login(server, email, password, deviceId, code) {
     throw new Error(j.ErrorModel?.Message || j.errorModel?.message || j.message || j.error_description || `Login failed (${r.status})`);
   }
   const protectedKey = j.Key || j.key;
-  return { kdf, protectedKey, userKey: await decrypt(protectedKey, await stretch(mk)), tokens: tokens(j) };
+  return { kdf, protectedKey, userKey: await decrypt(protectedKey, await stretch(mk)), tokens: tokens(j), twoFactorToken: j.TwoFactorToken || j.twoFactorToken };
 }
 
 export async function unlock(password, email, kdf, protectedKey) {
@@ -148,7 +150,7 @@ export async function unlock(password, email, kdf, protectedKey) {
 export async function refresh(server, refreshToken) {
   const body = new URLSearchParams({ grant_type: 'refresh_token', client_id: 'browser', refresh_token: refreshToken });
   const r = await post(`${urls(server).identity}/connect/token`, body, { 'Content-Type': 'application/x-www-form-urlencoded' });
-  if (!r.ok) throw new Error('Session expired, log out and log in again');
+  if (!r.ok) throw new Error(r.status === 400 || r.status === 401 ? 'Session expired; log in again with Add vault using the same server and email' : `Token refresh failed (${r.status})`);
   return { ...tokens(r.json), refresh: r.json.refresh_token || refreshToken };
 }
 
@@ -183,7 +185,8 @@ export async function decryptVault(sync, userKey, prev) {
       const passkeys = l.fido2Credentials?.length ? await Promise.all(l.fido2Credentials.map(async (f) =>
         Object.fromEntries(await Promise.all(PASSKEY_FIELDS.map(async (k) => [k, await decStr(f[k], key)]))))) : undefined;
       const m = l.uris?.some((u) => u.match != null) ? l.uris.map((u) => u.match) : undefined; // per-URI match type, when any is set
-      return { id: c.id, rev: c.revisionDate, raw: c, key, name, notes, username, password, totp, uris, m, passkeys };
+      return { id: c.id, rev: c.revisionDate, raw: c, key, name, notes, username, password, totp, uris, m, passkeys,
+        reprompt: c.reprompt === 1 || undefined, viewPassword: c.viewPassword === false ? false : undefined }; // undefined keeps the cached JSON small
     } catch (e) {
       console.warn('Skipping undecryptable item', c.id, e);
     }
@@ -209,11 +212,14 @@ export async function saveCipher(s, userKey, item, v) {
   c.name = await e(v.name);
   c.notes = await e(v.notes);
   Object.assign(c.login, { username: await e(v.username), password: await e(v.password), totp: await e(v.totp) });
-  c.login.uris = await Promise.all(v.uris.map(async (u) => ({
-    uri: await encrypt(u, key),
-    uriChecksum: await encrypt(b64(await sha256(u)), key), // official clients drop a URI whose checksum doesn't match
-    match: item?.raw.login?.uris?.[item.uris.indexOf(u)]?.match ?? null,
-  })));
+  c.login.uris = await Promise.all(v.uris.map(async (u, n) => {
+    const i = item?.uris.indexOf(u) ?? -1; // an edited URL keeps the match type of the one in its place
+    return {
+      uri: await encrypt(u, key),
+      uriChecksum: await encrypt(b64(await sha256(u)), key), // official clients drop a URI whose checksum doesn't match
+      match: item?.raw.login?.uris?.[i >= 0 ? i : n]?.match ?? null,
+    };
+  }));
   // one passkey per login, as in the official clients: saving one replaces the old
   if (v.passkey) c.login.fido2Credentials = [{
     ...Object.fromEntries(await Promise.all(PASSKEY_FIELDS.map(async (k) => [k, await e(v.passkey[k])]))), creationDate: v.passkey.creationDate }];
@@ -272,6 +278,23 @@ const suffixLength = (host) => {
 export function isPublicSuffix(host) {
   host = normalizeHost(host);
   return !!host && !ipHost(host) && host.split('.').length === suffixLength(host);
+}
+
+// WebAuthn related origins (L3 5.11.1): may `origin` use an rpId whose /.well-known/webauthn returned `json`?
+// Like Chrome, only the first 5 distinct registrable-domain labels in the list count.
+export function relatedOrigin(json, origin) {
+  const seen = new Set();
+  for (const o of Array.isArray(json?.origins) ? json.origins : []) {
+    let u;
+    try { u = new URL(o); } catch { continue; }
+    const host = normalizeHost(u.hostname);
+    if (!host || ipHost(host) || isPublicSuffix(host)) continue;
+    const label = baseDomain(host).split('.')[0];
+    if (seen.size >= 5 && !seen.has(label)) continue;
+    if (u.origin === origin) return true;
+    seen.add(label);
+  }
+  return false;
 }
 
 export function baseDomain(host) {

@@ -13,9 +13,12 @@ const requestId = (id) => typeof id === 'string' && id.length > 0 && id.length <
 
 // --- vault state, cached until anything in storage changes -------------------
 
-let state, stateVersion = 0, usedWrite = Promise.resolve();
+let state, building, stateVersion = 0, usedWrite = Promise.resolve();
+// One build shared by every caller: a storage change has every tab's badge ask at once.
 async function vault() {
-  if (state) return state;
+  return state || (building ??= build().finally(() => (building = null)));
+}
+async function build() {
   const version = stateVersion;
   const stored = await local.get(['accounts', 'used', 'neverSave']);
   const seen = new Set();
@@ -83,10 +86,10 @@ async function vault() {
     const current = await session.get(accounts.flatMap((a) => [`${a.id}:key`, `${a.id}:list`]));
     return accounts.every((a) => current[`${a.id}:key`] === s[`${a.id}:key`] && current[`${a.id}:list`] === s[`${a.id}:list`]);
   });
-  if (!stable) return vault();
+  if (!stable) return build();
   const eq = await local.get(accounts.map((a) => `${a.id}:eq`));
   const rank = (id) => accounts.findIndex((a) => a.id === id);
-  if (version !== stateVersion) return vault();
+  if (version !== stateVersion) return build();
   const equiv = new Map(accounts.map((a) => [a.id, bw.equivalents(eq[`${a.id}:eq`])]))
   return (state = { accounts, used, neverSave, items, open, equiv, rank });
 }
@@ -113,6 +116,11 @@ let redraw;
 chrome.storage.onChanged.addListener((changes, area) => {
   const relevant = area === 'local' || Object.keys(changes).some((k) => /:key$|:list$/.test(k));
   if (!relevant) return; // save/passkey hand-off records do not change the cached vault
+  if (area === 'local' && Object.keys(changes).join() === 'used') { // a fill's timestamp only reorders: no rebuild, no redraw
+    const used = changes.used.newValue;
+    if (state) state.used = used && typeof used === 'object' ? used : {};
+    return;
+  }
   state = null;
   stateVersion++;
   clearTimeout(redraw);
@@ -126,56 +134,59 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   if (command !== 'autofill' || !http(tab?.url)) return;
   const v = await vault();
   const version = stateVersion;
-  const [item] = forSite(v, tab.url);
+  const [item] = forSite(v, tab.url).filter((i) => !i.reprompt); // re-prompt logins need the master password, in the popup
   if (!item) return chrome.action.openPopup().catch(() => {}); // locked or nothing saved: show why
   if (version !== stateVersion) return;
   const code = item.totp ? (await bw.totp(item.totp).catch(() => null))?.code || null : null;
-  if (await fillTab(tab.id, item, v.equiv.get(item.a), code, async () => version === stateVersion, tab.documentId) && version === stateVersion) await markUsed(item, version);
+  if (await fillTab(tab.id, item, v.equiv.get(item.a), code, async () => version === stateVersion) && version === stateVersion) await markUsed(item, version);
 });
 
 // --- save offers: remembered per tab when a login is submitted, offered once the page has moved on -----------
 
-const pending = new Map(); // tabId -> { at, username, password, url, offer? }
+// session storage pending:<tabId> -> { at, username, url, origin, offer? }: the service worker is stopped when idle,
+// often between the two steps of a two-step login
 async function submitted(tabId, url, credentials) {
   if (!credentials || typeof credentials !== 'object') return;
   let { username, password } = credentials;
   if (!Number.isInteger(tabId) || !http(url) || typeof username !== 'string' || typeof password !== 'string') return;
   let page;
   try { page = new URL(url); } catch { return; }
-  const now = Date.now(), origin = page.origin;
-  const old = pending.get(tabId);
+  const now = Date.now(), origin = page.origin, key = `pending:${tabId}`;
+  const { [key]: old } = await session.get(key);
   const prev = old && now - old.at <= 60e3 && old.origin === origin ? old : null;
-  if (!password) return pending.set(tabId, { at: now, username, url, origin }); // username step of a two-step login
+  if (!password) return session.set({ [key]: { at: now, username, url, origin } }); // username step of a two-step login
   username ||= prev?.username || '';
   const version = stateVersion;
   const v = await vault();
-  if (version !== stateVersion || !v.open || v.neverSave.includes(new URL(url).hostname)) return pending.delete(tabId);
+  if (version !== stateVersion || !v.open || v.neverSave.includes(new URL(url).hostname)) return session.remove(key);
   const logins = forSite(v, url);
   const lower = username.toLowerCase();
   const same = username ? logins.filter((i) => i.username.toLowerCase() === lower) : logins.length === 1 ? logins : [];
   if (logins.some((i) => i.password === password && (!username || i.username.toLowerCase() === lower)) || (!username && !same.length && logins.length)) {
-    return pending.delete(tabId);
+    return session.remove(key);
   }
   const offer = same.length ? { kind: 'update', a: same[0].a, id: same[0].id, username: same[0].username } : { kind: 'add', username };
-  pending.set(tabId, { at: now, username, url, origin, offer: { ...offer, password, origin } });
+  // domain: sign-in often lands on another subdomain (login.example.com -> app.example.com)
+  await session.set({ [key]: { at: now, username, url, origin, offer: { ...offer, password, origin, domain: bw.baseDomain(page.hostname) } } });
 }
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.url || info.status === 'complete') badge(tabId, tab.url);
-  const p = pending.get(tabId);
   // loaded, or a single-page app moved to another URL
-  if (!(info.status === 'complete' || (info.url && tab.status === 'complete')) || !p?.offer) return;
-  if (Date.now() - p.at > 60e3) return pending.delete(tabId);
+  if (!(info.status === 'complete' || (info.url && tab.status === 'complete'))) return;
+  const { [`pending:${tabId}`]: p } = await session.get(`pending:${tabId}`);
+  if (!p?.offer) return;
+  await session.remove(`pending:${tabId}`); // offered once, or dropped
+  if (Date.now() - p.at > 60e3) return;
   let current;
-  try { current = new URL(tab.url); } catch { return pending.delete(tabId); }
-  if (!http(tab.url) || current.origin !== p.origin) return pending.delete(tabId);
-  pending.delete(tabId);
+  try { current = new URL(tab.url); } catch { return; }
+  if (!http(tab.url) || bw.baseDomain(current.hostname) !== p.offer.domain) return;
   const key = crypto.randomUUID();
   const version = stateVersion;
   await session.set({ [`save:${key}`]: { ...p.offer, tabId, expires: Date.now() + 60e3 } });
   if (version !== stateVersion) return session.remove(`save:${key}`);
   chrome.tabs.sendMessage(tabId, { bwliteBar: key }, { frameId: 0 }).catch(() => session.remove(`save:${key}`));
 });
-chrome.tabs.onRemoved.addListener((tabId) => pending.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => session.remove(`pending:${tabId}`));
 
 // The page bar only asks for review. The offer itself stays in session storage
 // and is opened in an extension window after Chrome authenticates the sender's
@@ -197,7 +208,7 @@ async function openSave(key, sender) {
     const keyName = `save:${key}`;
     const stored = await session.get(keyName);
     const offer = stored[keyName];
-    if (!offer || offer.opened || offer.tabId !== sender.tab.id || offer.origin !== page.origin
+    if (!offer || offer.opened || offer.tabId !== sender.tab.id || offer.domain !== bw.baseDomain(page.hostname)
       || !Number.isFinite(offer.expires) || offer.expires <= Date.now()) return { fallback: true };
     const opened = { ...offer, opened: true };
     await session.set({ [keyName]: opened });
@@ -213,9 +224,9 @@ async function openSave(key, sender) {
 
 // --- messages from inpage.js / bridge.js -----------------------------------------------
 
+// WebAuthn says to ignore unknown transports and descriptors of an unknown type (popup.js ids() skips those).
 const validDescriptor = (d) => d && typeof d === 'object' && typeof d.id === 'string' && d.id.length > 0 && d.id.length < 1000
-  && (d.type === undefined || d.type === 'public-key')
-  && (d.transports === undefined || Array.isArray(d.transports) && d.transports.every((t) => ['usb', 'nfc', 'ble', 'internal', 'hybrid', 'smart-card'].includes(t)));
+  && (d.transports === undefined || Array.isArray(d.transports) && d.transports.every((t) => typeof t === 'string'));
 const supportedPasskeyOptions = (kind, o) => {
   // Every passkey here is a user-verified platform discoverable key, so timeout, userVerification and residentKey
   // are always satisfiable and unknown extensions are ignored, as WebAuthn allows. Only a request that insists on a
@@ -229,8 +240,9 @@ const validPasskeyOptions = (kind, o) => {
   if (kind === 'create') return o.rp && typeof o.rp === 'object' && typeof o.rp.name === 'string' && o.rp.name.length < 1000
     && (o.rp.id === undefined || (typeof o.rp.id === 'string' && o.rp.id.length > 0))
     && o.user && typeof o.user === 'object' && typeof o.user.id === 'string' && o.user.id.length > 0 && typeof o.user.name === 'string'
-    && Array.isArray(o.pubKeyCredParams) && o.pubKeyCredParams.every((p) => p && typeof p === 'object' && Number.isInteger(p.alg)
-      && (p.type === undefined || p.type === 'public-key')) && o.pubKeyCredParams.some((p) => p.alg === -7)
+    // an empty list means ES256 and RS256; params of an unknown type are ignored
+    && Array.isArray(o.pubKeyCredParams) && o.pubKeyCredParams.every((p) => p && typeof p === 'object' && Number.isInteger(p.alg))
+    && (!o.pubKeyCredParams.length || o.pubKeyCredParams.some((p) => p.alg === -7 && (p.type ?? 'public-key') === 'public-key'))
     && (!o.excludeCredentials || (Array.isArray(o.excludeCredentials) && o.excludeCredentials.every(validDescriptor)));
   return kind === 'get' && (o.rpId === undefined || (typeof o.rpId === 'string' && o.rpId.length > 0))
     && (!o.allowCredentials || (Array.isArray(o.allowCredentials) && o.allowCredentials.every(validDescriptor)));
@@ -263,7 +275,7 @@ async function menu(sender) {
   if (!http(sender.url)) return [];
   const v = await vault();
   const multi = v.accounts.length > 1;
-  return forSite(v, sender.url).slice(0, 8).map((i) => ({
+  return forSite(v, sender.url).filter((i) => !i.reprompt).slice(0, 8).map((i) => ({
     k: `${i.a}:${i.id}`, username: i.username, name: multi ? `${i.name} · ${v.accounts.find((a) => a.id === i.a)?.label}` : i.name,
   }));
 }
@@ -272,7 +284,7 @@ async function fillFromMenu(k, sender) {
   const v = await vault();
   const version = stateVersion;
   const item = v.items.find((i) => `${i.a}:${i.id}` === k);
-  if (!item || version !== stateVersion || !http(sender.url) || !bw.matches(item, sender.url, v.equiv.get(item.a))) return null;
+  if (!item || item.reprompt || version !== stateVersion || !http(sender.url) || !bw.matches(item, sender.url, v.equiv.get(item.a))) return null;
   if (!await markUsed(item, version)) return null;
   const beforeCode = await session.get(`${item.a}:key`);
   if (!beforeCode[`${item.a}:key`]) return null;
@@ -294,15 +306,22 @@ async function passkey({ bwliteReq, kind, options: o }, { origin, tab, documentI
   if (typeof requested !== 'string' || !requested || /[\s\/?#@:]/.test(requested)) return fallback;
   let rpId;
   try { rpId = new URL(`https://${requested}`).hostname.toLowerCase().replace(/\.$/, ''); } catch { return fallback; }
-  // rpId must be the page's host or a registrable-domain suffix, never a public suffix.
-  if (page.origin !== origin || !https(origin) || !(host === rpId || host.endsWith(`.${rpId}`))
+  // rpId must be the page's host, a registrable-domain suffix or a related origin, never a public suffix.
+  if (page.origin !== origin || !https(origin)
     || (bw.isPublicSuffix(rpId) && !(host === 'localhost' && rpId === 'localhost'))) return fallback;
-  if (kind === 'create' && !o.pubKeyCredParams?.some((p) => p.alg === -7)) return fallback;
+  if (!(host === rpId || host.endsWith(`.${rpId}`)) && !(await relatedOrigins(rpId, origin))) return fallback;
   const version = stateVersion;
   if (!(await mayAnswer(kind, rpId))) return fallback;
   if (version !== stateVersion) return fallback;
   const key = crypto.randomUUID();
-  await session.set({ [`pk:${key}`]: { id: bwliteReq, kind, options: o, origin, rpId, tabId: tab.id, documentId } });
+  // One window per tab; the lock makes check-and-set atomic against a page firing many requests at once. The window
+  // closes itself at `expires` (page.js uses the same clamp plus slack), so a stale record frees the tab.
+  const busy = await withStateLock(async () => {
+    if (Object.entries(await session.get(null)).some(([k, r]) => k.startsWith('pk:') && r?.tabId === tab.id && r.expires > Date.now())) return true;
+    await session.set({ [`pk:${key}`]: { id: bwliteReq, kind, options: o, origin, rpId, tabId: tab.id, documentId,
+      expires: Date.now() + Math.min(Math.max(Number(o.timeout) || 300e3, 60e3), 600e3) } });
+  });
+  if (busy) return { bwliteRes: bwliteReq, error: { name: 'NotAllowedError', message: 'A passkey request is already pending' } };
   if (version !== stateVersion) return session.remove(`pk:${key}`).then(() => fallback);
   try {
     await chrome.windows.create({ url: `popup.html#pk=${key}`, type: 'popup', width: 410, height: 320 });
@@ -311,6 +330,14 @@ async function passkey({ bwliteReq, kind, options: o }, { origin, tab, documentI
     throw e;
   }
   return null;
+}
+
+// e.g. www.facebook.com signing in with rpId accounts.meta.com, allowed by https://accounts.meta.com/.well-known/webauthn
+async function relatedOrigins(rpId, origin) {
+  try {
+    const r = await fetch(`https://${rpId}/.well-known/webauthn`, { credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error' });
+    return r.ok && bw.relatedOrigin(await r.json(), origin);
+  } catch { return false; }
 }
 
 // No vaults: leave passkeys to the browser. Sign-in: skip the window when every vault is open and none has a
