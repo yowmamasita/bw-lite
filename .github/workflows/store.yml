@@ -35,7 +35,7 @@ jobs:
       CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
       REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
       EXTENSION_ID: dfjjkaikjkemjhjnpmbimmlbbccngmjb
-      PUBLISHER_ID: 4153827d-03c2-44a6-9aeb-e9a0d211e2d1
+      PUBLISHER_ID: ${{ vars.CWS_PUBLISHER_ID }} # the Web Store publisher id; a repository variable only because its UUID shape trips secret scanning
     steps:
       - uses: actions/setup-node@v7
         with:
