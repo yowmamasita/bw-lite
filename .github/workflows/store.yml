@@ -1,0 +1,59 @@
+name: Stores
+
+# Submits a published GitHub release to Firefox Add-ons and the Chrome Web Store. Not every release goes to the stores,
+# so this runs by hand: Actions → Stores → Run workflow, or `gh workflow run store.yml -f tag=v0.4.2`.
+# Secrets: AMO_JWT_ISSUER / AMO_JWT_SECRET (addons.mozilla.org/developers/addon/api/key/) and
+# CWS_CLIENT_ID / CWS_CLIENT_SECRET / CWS_REFRESH_TOKEN (github.com/fregante/chrome-webstore-upload-keys).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.4.2'
+        required: true
+      firefox:
+        description: 'Submit to Firefox Add-ons'
+        type: boolean
+        default: true
+      chrome:
+        description: 'Submit to the Chrome Web Store'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+      AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+      CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+      EXTENSION_ID: dfjjkaikjkemjhjnpmbimmlbbccngmjb
+      PUBLISHER_ID: 4153827d-03c2-44a6-9aeb-e9a0d211e2d1
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Download the release
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist && ls dist
+      - name: Submit to Firefox Add-ons
+        if: inputs.firefox
+        run: |
+          v=${TAG#v}
+          mkdir -p dist/firefox && unzip -qo "dist/bw-lite-$v-firefox.zip" -d dist/firefox
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body | node -e '
+            const fs = require("fs"), notes = fs.readFileSync(0, "utf8").split("\n").slice(1).join("\n").trim(); // first line is the title
+            const approval_notes = "No build step: the source archive is the repository at this tag. vendor/argon2.umd.min.js is dist/argon2.umd.min.js from the hash-wasm 4.12.0 npm package, unmodified; vendor/public_suffix_list.js is generated from the included vendor/public_suffix_list.dat by vendor/psl.sh. Tests: node test.mjs.";
+            fs.writeFileSync("amo.json", JSON.stringify({ version: { release_notes: { "en-US": notes }, approval_notes } }));'
+          npx --yes web-ext@10.8.0 sign --channel listed --source-dir dist/firefox --artifacts-dir dist/signed \
+            --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET" --upload-source-code "dist/bw-lite-$v-source.zip" \
+            --amo-metadata amo.json --approval-timeout 0
+      - name: Submit to the Chrome Web Store
+        if: inputs.chrome
+        run: npx --yes chrome-webstore-upload-cli@4.0.2 --source "dist/bw-lite-${TAG#v}-chrome.zip" # no sub-command: upload, then publish
