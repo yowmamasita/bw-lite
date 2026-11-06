@@ -10,12 +10,13 @@ if (!globalThis.bwliteFill) {
   };
   // Only the focused field's form, so a search box elsewhere on the page is never taken for the username.
   // loose: with no password field, fall back to the only text field (the username step of a two-step login).
+  // user is an input or undefined, never false: `false?.value` is undefined, so capture()'s .trim() would throw.
   // ponytail: fields inside shadow DOM aren't seen.
   const loginFields = (loose) => {
     const root = document.activeElement?.closest('form') || document;
     const all = [...root.querySelectorAll('input')].filter(visible), pw = all.find((i) => i.type === 'password');
     const texts = (pw ? all.slice(0, all.indexOf(pw)) : all).filter((i) => ['text', 'email', 'tel'].includes(i.type));
-    const user = pw ? texts.at(-1) : texts.find((i) => i.type === 'email' || /user|email|login/i.test(i.autocomplete + i.name + i.id)) || (loose && texts.length === 1 && texts[0]);
+    const user = pw ? texts.at(-1) : texts.find((i) => i.type === 'email' || /user|email|login/i.test(i.autocomplete + i.name + i.id)) || (loose && texts.length === 1 ? texts[0] : undefined);
     return { all, user, pw };
   };
 
