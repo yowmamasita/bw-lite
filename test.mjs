@@ -674,6 +674,26 @@ console.log('popup storage, passkey, account, save-window, and move checks ok');
   console.log('page credential checks ok');
 }
 const inpageSource = await readFile('./inpage.js', 'utf8');
+{ // a click on a page with no password field and no single username-like field (Google's OAuth consent page) used to
+  // throw in capture(): loginFields gave user = false and `false?.value.trim()` failed
+  const on = {}, sent = [];
+  class El { closest() { return null; } }
+  class HTMLInput extends El { getBoundingClientRect() { return { width: 100, right: 100, bottom: 10 }; } }
+  const input = (name) => Object.assign(new HTMLInput(), { name, id: '', autocomplete: '', type: 'text', value: 'x' });
+  const button = Object.assign(new El(), { closest: (s) => (s.includes('button') ? button : null) });
+  for (const inputs of [[], [input('q'), input('code')]]) {
+    const ctx = {
+      HTMLInputElement: HTMLInput, scrollX: 0, scrollY: 0, getComputedStyle: () => ({ visibility: 'visible' }), navigator: {}, addEventListener() {},
+      document: { activeElement: null, querySelectorAll: () => inputs, addEventListener: (t, f) => (on[t] ||= []).push(f) },
+      chrome: { runtime: { sendMessage: async (m) => (sent.push(m), null), onMessage: { addListener() {} } } },
+    };
+    ctx.globalThis = ctx;
+    for (const k in on) delete on[k];
+    vm.runInNewContext(inpageSource, ctx);
+    for (const f of on.click) assert.doesNotThrow(() => f({ isTrusted: true, target: button }), 'a click on a page without login fields');
+  }
+  assert.ok(!sent.some((m) => m.bwliteSubmit), 'no login to offer when there is no username or password');
+}
 assert.equal(inpageSource.includes('popup.html#save='), false, 'the page bar cannot frame the extension popup');
 assert.equal(inpageSource.includes('attachShadow({ mode: \'closed\' })'), true, 'the save token stays in a closed extension bar');
 assert.match(inpageSource, /addEventListener\('click', async \(e\) => \{[^}]*elementFromPoint/, 'a menu click fills only when it hit the visible menu');
